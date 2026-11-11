@@ -1,0 +1,43 @@
+{
+  "name": "festa-booking-service",
+  "version": "1.0.0",
+  "description": "RF7, RF10: asistencia y QR único de un solo uso",
+  "main": "src/server.js",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "migrate": "node src/db/migrate.js",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "test:ci": "vitest run --reporter=junit --outputFile=test-results/junit.xml"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Desparcha2-SWNT/festa-booking-service.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "UNLICENSED",
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/Desparcha2-SWNT/festa-booking-service/issues"
+  },
+  "homepage": "https://github.com/Desparcha2-SWNT/festa-booking-service#readme",
+  "dependencies": {
+    "express": "^5.3.0",
+    "jsonwebtoken": "^9.0.3",
+    "pg": "^8.23.1",
+    "pino": "^10.4.0",
+    "pino-http": "^11.0.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.13.0",
+    "supertest": "^7.3.1",
+    "vitest": "^5.0.5"
+  }
+}
