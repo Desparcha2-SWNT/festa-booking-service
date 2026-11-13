@@ -40,14 +40,15 @@ function toAttendance(eventId, attendance, attendeeCount) {
   };
 }
 
-export function toConfirmedMessage(event, attendance, userId, attendeeCount) {
+export function toConfirmedMessage(event, attendance, userId, attendeeCount, { source = 'rsvp', orderId } = {}) {
   return {
     attendanceId: attendance.id,
     eventId: event.event_id,
     eventTitle: event.title,
     eventStartsAt: event.starts_at.toISOString(),
     userId,
-    source: 'rsvp',
+    source,
+    ...(orderId ? { orderId } : {}),
     passIds: attendance.pass_ids,
     attendeeCount,
     confirmedAt: attendance.confirmed_at.toISOString(),
@@ -110,10 +111,12 @@ export async function revokeAttendance(client, { attendanceId, eventId, userId, 
     'UPDATE passes SET revoked_at = now() WHERE attendance_id = $1 AND revoked_at IS NULL RETURNING id',
     [attendanceId],
   );
+  // Una asistencia con boletas ocupa un cupo por pase; un RSVP, uno solo.
+  const seats = Math.max(passes.rows.length, 1);
   const counted = await client.query(
-    `UPDATE event_projection SET attendee_count = GREATEST(attendee_count - 1, 0), updated_at = now()
+    `UPDATE event_projection SET attendee_count = GREATEST(attendee_count - $2, 0), updated_at = now()
      WHERE event_id = $1 RETURNING attendee_count`,
-    [eventId],
+    [eventId, seats],
   );
 
   await enqueue(client, {
