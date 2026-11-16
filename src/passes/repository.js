@@ -144,6 +144,12 @@ export async function issueTickets(client, order, causationId) {
   const event = events[0];
   // El evento aún no llega a la proyección (mensajes desordenados): error transitorio, se reintenta.
   if (!event) throw new Error(`evento ${order.eventId} aún no está en la proyección`);
+  // Carrera: la orden se aprobó después de que el evento se canceló o terminó. No se emiten pases ni se
+  // suma al cupo. La fila está bloqueada (FOR UPDATE), así que event.cancelled ya comprometido se ve aquí.
+  // La compensación (reembolso) la decide el equipo: ver order.refund_requested en contracts/README.md.
+  if (event.status !== 'published' || new Date(event.ends_at) <= new Date()) {
+    throw new Error(`orden ${order.orderId} aprobada para el evento cerrado ${order.eventId} (status=${event.status}); requiere compensación`);
+  }
 
   const { rows } = await client.query(
     `INSERT INTO attendances (event_id, user_id, source, order_id) VALUES ($1, $2, 'ticket', $3) RETURNING id, confirmed_at`,

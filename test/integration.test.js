@@ -138,4 +138,39 @@ describe.skipIf(!DB || !hasContracts)('booking-service con PostgreSQL', () => {
     await run('event.published', event);
     expect((await attendance.confirmAttendance(event.eventId, BUYER, null)).outcome).toBe('requires_ticket');
   });
+
+  it('un snapshot retrasado no reabre un evento expirado', async () => {
+    const event = eventSnapshot({ version: 1 });
+    await run('event.published', event);
+    await run('event.expired', { eventId: event.eventId, expiredAt: new Date().toISOString(), isLive: false });
+    // event.expired no lleva versión: el event.updated retrasado (versión 2) no debe pasar la guarda.
+    await run('event.updated', { ...event, version: 2, status: 'published' });
+    const { rows } = await pool.query('SELECT status FROM event_projection WHERE event_id = $1', [event.eventId]);
+    expect(rows[0].status).toBe('expired');
+  });
+
+  it('un snapshot retrasado no reabre un evento cancelado', async () => {
+    const event = eventSnapshot({ version: 1 });
+    await run('event.published', event);
+    await run('event.cancelled', { eventId: event.eventId, version: 2, cancelledAt: new Date().toISOString() });
+    await run('event.updated', { ...event, version: 3, status: 'published' });
+    const { rows } = await pool.query('SELECT status FROM event_projection WHERE event_id = $1', [event.eventId]);
+    expect(rows[0].status).toBe('cancelled');
+  });
+
+  it('una orden aprobada después de cancelar el evento no emite pases ni suma cupo', async () => {
+    const event = eventSnapshot({ ticketed: true, priceCents: 1000, version: 1 });
+    await run('event.published', event);
+    await run('event.cancelled', { eventId: event.eventId, version: 2, cancelledAt: new Date().toISOString() });
+    const order = {
+      orderId: crypto.randomUUID(), eventId: event.eventId, organizerId: ORGANIZER, buyerId: BUYER, quantity: 2,
+      unitPriceCents: 1000, subtotalCents: 2000, commissionCents: 160, totalCents: 2160, currency: 'COP',
+      paymentMethod: 'NEQUI', providerTransactionId: 'tx', approvedAt: new Date().toISOString(),
+    };
+    await expect(run('order.approved', order)).rejects.toThrow(/requiere compensación/);
+    const { rows } = await pool.query('SELECT attendee_count FROM event_projection WHERE event_id = $1', [event.eventId]);
+    expect(rows[0].attendee_count).toBe(0);
+    const { rowCount } = await pool.query('SELECT 1 FROM attendances WHERE order_id = $1', [order.orderId]);
+    expect(rowCount).toBe(0);
+  });
 });
