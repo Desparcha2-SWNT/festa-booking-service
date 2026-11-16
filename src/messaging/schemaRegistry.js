@@ -25,6 +25,8 @@ function build(contractsDir) {
   for (const domain of fs.readdirSync(eventsDir)) {
     const domainDir = path.join(eventsDir, domain);
     for (const file of fs.readdirSync(domainDir)) {
+      // Solo los esquemas: un README o un archivo del sistema en el catálogo no debe impedir el arranque.
+      if (!file.endsWith('.json')) continue;
       const schema = readJson(path.join(domainDir, file));
       dataValidators.set(schema['x-routing-key'], ajv.compile(schema));
       producers.set(schema['x-routing-key'], schema['x-producer']);

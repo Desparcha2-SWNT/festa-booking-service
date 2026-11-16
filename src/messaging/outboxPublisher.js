@@ -22,7 +22,7 @@ export function startOutboxPublisher(connection, { intervalMs = 2000 } = {}) {
       const channel = await channelPromise;
       await client.query('BEGIN');
       const { rows } = await client.query(
-        `SELECT id, event_id, correlation_id, causation_id, exchange, routing_key, payload FROM outbox
+        `SELECT id, event_id, created_at, correlation_id, causation_id, exchange, routing_key, payload FROM outbox
          WHERE sent_at IS NULL ORDER BY created_at LIMIT 50 FOR UPDATE SKIP LOCKED`,
       );
 
@@ -31,7 +31,8 @@ export function startOutboxPublisher(connection, { intervalMs = 2000 } = {}) {
           eventId: row.event_id,
           eventType: row.routing_key,
           version: 1,
-          occurredAt: new Date().toISOString(),
+          // Cuándo ocurrió el hecho (la fila del outbox), no cuándo se publica: un reintento conserva la misma fecha.
+          occurredAt: new Date(row.created_at).toISOString(),
           producer: 'booking-service',
           correlationId: row.correlation_id,
           causationId: row.causation_id,
