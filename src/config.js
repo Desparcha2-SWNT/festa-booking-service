@@ -29,5 +29,9 @@ export const config = {
   jwtPublicKeyPath: required('JWT_PUBLIC_KEY_PATH'),
   // En la imagen de Docker el Dockerfile copia los contratos a ./contracts y fija esta
   // variable; en local, por defecto asume festa-infra clonado como hermano de este repo.
+  // RF10/RNF7: secreto HMAC con el que se firma el contenido de cada QR (festa-infra/scripts/gen-secrets.sh).
+  qrSigningSecretPath: required('QR_SIGNING_SECRET_PATH'),
+  // El ingreso se habilita estos minutos antes del inicio y cierra cuando termina el evento.
+  checkInOpensMinutesBefore: Number(process.env.CHECKIN_OPENS_MINUTES_BEFORE ?? 120),
   contractsDir: process.env.FESTA_CONTRACTS_DIR ?? path.resolve('../festa-infra/contracts'),
 };

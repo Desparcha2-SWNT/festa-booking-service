@@ -1,19 +1,30 @@
 import { revokeAttendance } from '../attendance/repository.js';
+import { issueTickets, revokeOrder } from '../passes/repository.js';
 
 // Un handler por tipo de mensaje consumido. Recibe `data` del sobre, el `client` de una transacción
 // ya abierta y el `envelope` completo. Lo que no tenga handler se confirma sin efecto.
 
+/** Marca el evento como cerrado: un snapshot posterior no lo vuelve a publicar. */
+async function closeEvent(client, eventId, status) {
+  await client.query(`INSERT INTO closed_events (event_id, status) VALUES ($1, $2) ON CONFLICT (event_id) DO NOTHING`, [
+    eventId,
+    status,
+  ]);
+}
+
 /** event.published y event.updated traen el snapshot completo. Se ignora uno más viejo que el guardado. */
 async function upsertSnapshot(data, client) {
+  const { rowCount } = await client.query('SELECT 1 FROM closed_events WHERE event_id = $1', [data.eventId]);
+  if (rowCount > 0) return; // evento cancelado o expirado: un snapshot retrasado no lo reabre
   await client.query(
-    `INSERT INTO event_projection (event_id, title, starts_at, ends_at, capacity, ticketed, status, version)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+    `INSERT INTO event_projection (event_id, title, starts_at, ends_at, capacity, ticketed, status, version, organizer_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
      ON CONFLICT (event_id) DO UPDATE SET
-       title = EXCLUDED.title, starts_at = EXCLUDED.starts_at, ends_at = EXCLUDED.ends_at,
+       organizer_id = EXCLUDED.organizer_id, title = EXCLUDED.title, starts_at = EXCLUDED.starts_at, ends_at = EXCLUDED.ends_at,
        capacity = EXCLUDED.capacity, ticketed = EXCLUDED.ticketed, status = EXCLUDED.status,
        version = EXCLUDED.version, updated_at = now()
      WHERE event_projection.version < EXCLUDED.version`,
-    [data.eventId, data.title, data.startsAt, data.endsAt, data.capacity, data.ticketed, data.status, data.version],
+    [data.eventId, data.title, data.startsAt, data.endsAt, data.capacity, data.ticketed, data.status, data.version, data.organizerId],
   );
 }
 
@@ -22,6 +33,7 @@ export const handlers = {
   'event.updated': upsertSnapshot,
 
   'event.expired': async (data, client) => {
+    await closeEvent(client, data.eventId, 'expired');
     await client.query(`UPDATE event_projection SET status = 'expired', updated_at = now() WHERE event_id = $1`, [
       data.eventId,
     ]);
@@ -29,6 +41,7 @@ export const handlers = {
 
   // contracts/README.md § Evento cancelado: se revocan los pases y se avisa por cada asistente.
   'event.cancelled': async (data, client, envelope) => {
+    await closeEvent(client, data.eventId, 'cancelled');
     await client.query(
       `UPDATE event_projection SET status = 'cancelled', version = GREATEST(version, $2), updated_at = now()
        WHERE event_id = $1`,
@@ -64,5 +77,15 @@ export const handlers = {
       });
     }
     await client.query('DELETE FROM attendances WHERE user_id = $1', [data.userId]);
+  },
+
+  // RF11 → RF10: pago aprobado. Crea la asistencia con un pase QR por boleta.
+  'order.approved': async (data, client, envelope) => {
+    await issueTickets(client, data, envelope.eventId);
+  },
+
+  // Reembolso hecho: los pases de la orden quedan revocados.
+  'order.refunded': async (data, client, envelope) => {
+    await revokeOrder(client, data, envelope.eventId);
   },
 };
