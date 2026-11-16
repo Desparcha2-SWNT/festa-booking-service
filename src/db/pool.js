@@ -12,7 +12,8 @@ export async function withTransaction(fn) {
     await client.query('COMMIT');
     return result;
   } catch (err) {
-    await client.query('ROLLBACK');
+    // Si el ROLLBACK también falla, se conserva el error original de `fn`, que es la causa real.
+    await client.query('ROLLBACK').catch(() => {});
     throw err;
   } finally {
     client.release();
