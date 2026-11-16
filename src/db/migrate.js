@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { pool } from './pool.js';
 import { logger } from '../logger.js';
 
@@ -57,7 +57,8 @@ export async function migrate() {
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+// pathToFileURL evita que las barras de Windows rompan la comparación al correr `node src/db/migrate.js`.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   migrate()
     .then(() => pool.end())
     .catch((err) => {

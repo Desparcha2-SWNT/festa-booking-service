@@ -16,7 +16,11 @@ async function main() {
 
   const shutdown = async () => {
     logger.info('apagando...');
-    server.close();
+    // server.close espera a que terminen las conexiones abiertas: se espera su callback antes de cerrar la base.
+    await new Promise((resolve) => {
+      server.close(resolve);
+      server.closeIdleConnections();
+    });
     await messaging.stop();
     await pool.end();
     process.exit(0);
