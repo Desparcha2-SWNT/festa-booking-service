@@ -1,7 +1,7 @@
 // Variables de entorno y una llave JWT desechable para que los módulos que las leen al
 // importarse (config.js, middleware/auth.js) no truenen al cargar las pruebas. La misma
 // llave (test/fixtures/jwtKeys.js) la usan las pruebas que necesitan firmar un token.
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { jwtPublicKeyPem } from './fixtures/jwtKeys.js';
@@ -9,6 +9,8 @@ import { jwtPublicKeyPem } from './fixtures/jwtKeys.js';
 const dir = mkdtempSync(path.join(tmpdir(), 'festa-booking-service-test-'));
 const publicKeyPath = path.join(dir, 'jwt_public.pem');
 writeFileSync(publicKeyPath, jwtPublicKeyPem);
+// Se borra al terminar el proceso: sin esto cada corrida (sobre todo con --watch) deja un directorio en tmp.
+process.on('exit', () => rmSync(dir, { recursive: true, force: true }));
 
 process.env.DATABASE_URL = process.env.TEST_DATABASE_URL ?? process.env.DATABASE_URL ?? 'postgres://test:test@localhost:5432/booking_db_test';
 process.env.AMQP_URL ??= 'amqp://test:test@localhost:5672';

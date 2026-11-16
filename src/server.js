@@ -8,16 +8,22 @@ import { startMessaging } from './messaging/supervisor.js';
 async function main() {
   await migrate();
 
-  const messaging = await startMessaging();
-
+  // HTTP primero: /health responde aunque RabbitMQ todavía no acepte conexiones (startMessaging reintenta).
+  let messaging = null;
   const server = createApp().listen(config.port, () => {
     logger.info({ port: config.port }, 'festa-booking-service arriba');
   });
 
+  messaging = await startMessaging();
+
   const shutdown = async () => {
     logger.info('apagando...');
-    server.close();
-    await messaging.stop();
+    // server.close espera a que terminen las conexiones abiertas: se espera su callback antes de cerrar la base.
+    await new Promise((resolve) => {
+      server.close(resolve);
+      server.closeIdleConnections();
+    });
+    await messaging?.stop();
     await pool.end();
     process.exit(0);
   };

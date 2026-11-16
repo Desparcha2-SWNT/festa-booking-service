@@ -46,13 +46,14 @@ export async function startMessaging({ retryMs = 3000 } = {}) {
       return;
     }
 
+    // La anterior se cierra ANTES de armar la nueva: así nunca quedan dos publicadores o consumidores
+    // activos sobre el mismo outbox/inbox, ni siquiera por un instante.
+    const previous = current;
+    current = null;
+    await teardown(previous);
     const publisher = startOutboxPublisher(connection);
     const consumerChannel = await startInboxConsumer(connection);
-    const previous = current;
     current = { connection, publisher, consumerChannel };
-    // La anterior se cierra DESPUÉS de armar la nueva, no antes: si seguía viva por el tiempo
-    // que sea, nunca quedan las dos publicando/consumiendo el mismo outbox/inbox a la vez.
-    await teardown(previous);
 
     connection.once('close', () => {
       if (stopped) return;
