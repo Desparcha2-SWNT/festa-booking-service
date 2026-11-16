@@ -13,6 +13,7 @@ writeFileSync(publicKeyPath, jwtPublicKeyPem);
 process.on('exit', () => rmSync(dir, { recursive: true, force: true }));
 
 process.env.DATABASE_URL ??= 'postgres://test:test@localhost:5432/booking_db_test';
+process.env.AMQP_URL ??= 'amqp://test:test@localhost:5672';
 process.env.JWT_ISSUER ??= 'festa-auth';
 process.env.JWT_PUBLIC_KEY_PATH = publicKeyPath;
 process.env.LOG_LEVEL ??= 'silent';
