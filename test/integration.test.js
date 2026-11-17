@@ -173,4 +173,36 @@ describe.skipIf(!DB || !hasContracts)('booking-service con PostgreSQL', () => {
     const { rowCount } = await pool.query('SELECT 1 FROM attendances WHERE order_id = $1', [order.orderId]);
     expect(rowCount).toBe(0);
   });
+
+  // event-service ordena los conteos por confirmedAt / cancelledAt: si la hora fuera la del BEGIN, una
+  // transacción que esperó el candado publicaría el conteo más nuevo con una hora más vieja.
+  it('la hora de confirmar y cancelar es la de cuando se toma el candado del evento', async () => {
+    const event = eventSnapshot();
+    await run('event.published', event);
+
+    async function whileLocked(action) {
+      const holder = await pool.connect();
+      try {
+        await holder.query('BEGIN');
+        await holder.query('SELECT 1 FROM event_projection WHERE event_id = $1 FOR UPDATE', [event.eventId]);
+        const pending = action();
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        const { rows } = await holder.query('SELECT clock_timestamp() AS t');
+        await holder.query('COMMIT');
+        return { result: await pending, releasedAt: rows[0].t };
+      } finally {
+        holder.release();
+      }
+    }
+
+    const confirmed = await whileLocked(() => attendance.confirmAttendance(event.eventId, STRANGER, null));
+    expect(confirmed.result.outcome).toBe('confirmed');
+    const confirmMsg = (await outbox('attendance.confirmed')).find((m) => m.eventId === event.eventId && m.userId === STRANGER);
+    expect(new Date(confirmMsg.confirmedAt).getTime()).toBeGreaterThanOrEqual(confirmed.releasedAt.getTime());
+
+    const cancelled = await whileLocked(() => attendance.cancelAttendance(event.eventId, STRANGER, null));
+    expect(cancelled.result.outcome).toBe('cancelled');
+    const cancelMsg = (await outbox('attendance.cancelled')).find((m) => m.eventId === event.eventId && m.userId === STRANGER);
+    expect(new Date(cancelMsg.cancelledAt).getTime()).toBeGreaterThanOrEqual(cancelled.releasedAt.getTime());
+  });
 });

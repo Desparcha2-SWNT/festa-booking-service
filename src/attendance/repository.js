@@ -104,7 +104,8 @@ export async function confirmAttendance(eventId, userId, correlationId) {
  */
 export async function revokeAttendance(client, { attendanceId, eventId, userId, reason, correlationId, causationId }) {
   const cancelled = await client.query(
-    `UPDATE attendances SET status = 'cancelled', cancelled_at = now() WHERE id = $1 RETURNING cancelled_at`,
+    // clock_timestamp() y no now(): la hora del cambio, ya con el candado del evento (ver migración 006).
+    `UPDATE attendances SET status = 'cancelled', cancelled_at = clock_timestamp() WHERE id = $1 RETURNING cancelled_at`,
     [attendanceId],
   );
   const passes = await client.query(
