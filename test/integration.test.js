@@ -174,35 +174,87 @@ describe.skipIf(!DB || !hasContracts)('booking-service con PostgreSQL', () => {
     expect(rowCount).toBe(0);
   });
 
-  // event-service ordena los conteos por confirmedAt / cancelledAt: si la hora fuera la del BEGIN, una
-  // transacción que esperó el candado publicaría el conteo más nuevo con una hora más vieja.
-  it('la hora de confirmar y cancelar es la de cuando se toma el candado del evento', async () => {
-    const event = eventSnapshot();
-    await run('event.published', event);
+  // event-service ordena los conteos por confirmedAt / cancelledAt: si la hora se fijara antes de tener el
+  // candado del evento, una transacción que lo esperó publicaría el conteo más nuevo con una hora más vieja.
+  describe('la hora de confirmar y cancelar es posterior al candado del evento', () => {
+    /** Espera a que otra conexión quede esperando un candado de fila (no basta con dejar pasar tiempo). */
+    async function untilSomeoneWaits(holderPid) {
+      const deadline = Date.now() + 5_000;
+      while (Date.now() < deadline) {
+        const { rowCount } = await pool.query(
+          `SELECT 1 FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND $1 = ANY(pg_blocking_pids(pid))`,
+          [holderPid],
+        );
+        if (rowCount > 0) return;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      throw new Error('ninguna consulta llegó a esperar el candado del evento');
+    }
 
-    async function whileLocked(action) {
+    /** Retiene el evento con FOR UPDATE, lanza la acción, espera a que quede bloqueada y libera. */
+    async function whileLocked(eventId, action) {
       const holder = await pool.connect();
       try {
         await holder.query('BEGIN');
-        await holder.query('SELECT 1 FROM event_projection WHERE event_id = $1 FOR UPDATE', [event.eventId]);
+        await holder.query('SELECT 1 FROM event_projection WHERE event_id = $1 FOR UPDATE', [eventId]);
+        const { rows: me } = await holder.query('SELECT pg_backend_pid() AS pid');
         const pending = action();
-        await new Promise((resolve) => setTimeout(resolve, 300));
+        pending.catch(() => {}); // el error, si lo hay, se ve en el await de abajo
+        await untilSomeoneWaits(me[0].pid);
         const { rows } = await holder.query('SELECT clock_timestamp() AS t');
         await holder.query('COMMIT');
-        return { result: await pending, releasedAt: rows[0].t };
+        return { result: await pending, releasedAt: rows[0].t.getTime() };
       } finally {
         holder.release();
       }
     }
 
-    const confirmed = await whileLocked(() => attendance.confirmAttendance(event.eventId, STRANGER, null));
-    expect(confirmed.result.outcome).toBe('confirmed');
-    const confirmMsg = (await outbox('attendance.confirmed')).find((m) => m.eventId === event.eventId && m.userId === STRANGER);
-    expect(new Date(confirmMsg.confirmedAt).getTime()).toBeGreaterThanOrEqual(confirmed.releasedAt.getTime());
+    const cancelledOf = async (attendanceId) =>
+      (await outbox('attendance.cancelled')).find((m) => m.attendanceId === attendanceId);
 
-    const cancelled = await whileLocked(() => attendance.cancelAttendance(event.eventId, STRANGER, null));
-    expect(cancelled.result.outcome).toBe('cancelled');
-    const cancelMsg = (await outbox('attendance.cancelled')).find((m) => m.eventId === event.eventId && m.userId === STRANGER);
-    expect(new Date(cancelMsg.cancelledAt).getTime()).toBeGreaterThanOrEqual(cancelled.releasedAt.getTime());
+    it('RSVP: confirmar y cancelar', async () => {
+      const event = eventSnapshot();
+      await run('event.published', event);
+
+      const confirmed = await whileLocked(event.eventId, () => attendance.confirmAttendance(event.eventId, STRANGER, null));
+      expect(confirmed.result.outcome).toBe('confirmed');
+      const confirmMsg = (await outbox('attendance.confirmed')).find((m) => m.eventId === event.eventId && m.userId === STRANGER);
+      expect(new Date(confirmMsg.confirmedAt).getTime()).toBeGreaterThanOrEqual(confirmed.releasedAt);
+
+      const cancelled = await whileLocked(event.eventId, () => attendance.cancelAttendance(event.eventId, STRANGER, null));
+      expect(cancelled.result.outcome).toBe('cancelled');
+      const cancelMsg = await cancelledOf(confirmed.result.attendance.attendanceId);
+      expect(new Date(cancelMsg.cancelledAt).getTime()).toBeGreaterThanOrEqual(cancelled.releasedAt);
+    });
+
+    it('order.refunded', async () => {
+      const event = eventSnapshot({ ticketed: true, priceCents: 1000 });
+      await run('event.published', event);
+      const order = {
+        orderId: crypto.randomUUID(), eventId: event.eventId, organizerId: ORGANIZER, buyerId: BUYER, quantity: 1,
+        unitPriceCents: 1000, subtotalCents: 1000, commissionCents: 80, totalCents: 1080, currency: 'COP',
+        paymentMethod: 'NEQUI', providerTransactionId: 'tx', approvedAt: new Date().toISOString(),
+      };
+      await run('order.approved', order);
+      const { rows } = await pool.query('SELECT id FROM attendances WHERE order_id = $1', [order.orderId]);
+
+      const refund = { orderId: order.orderId, eventId: event.eventId, buyerId: BUYER, amountCents: 1080, refundedBy: ORGANIZER, refundedAt: new Date().toISOString() };
+      const { releasedAt } = await whileLocked(event.eventId, () => run('order.refunded', refund));
+      const cancelMsg = await cancelledOf(rows[0].id);
+      expect(cancelMsg).toMatchObject({ reason: 'refunded', attendeeCount: 0 });
+      expect(new Date(cancelMsg.cancelledAt).getTime()).toBeGreaterThanOrEqual(releasedAt);
+    });
+
+    it('account.deleted', async () => {
+      const event = eventSnapshot();
+      await run('event.published', event);
+      const userId = crypto.randomUUID();
+      const confirmed = await attendance.confirmAttendance(event.eventId, userId, null);
+
+      const { releasedAt } = await whileLocked(event.eventId, () => run('account.deleted', { userId, deletedAt: new Date().toISOString() }));
+      const cancelMsg = await cancelledOf(confirmed.attendance.attendanceId);
+      expect(cancelMsg).toMatchObject({ reason: 'account_deleted', attendeeCount: 0 });
+      expect(new Date(cancelMsg.cancelledAt).getTime()).toBeGreaterThanOrEqual(releasedAt);
+    });
   });
 });

@@ -7,7 +7,7 @@ const EXCHANGE = 'festa.booking';
  * Toma el candado de la fila del evento. Todas las operaciones que cambian el conteo pasan por
  * aquí, así dos confirmaciones simultáneas no pueden ocupar el mismo último cupo.
  */
-async function lockEvent(client, eventId) {
+export async function lockEvent(client, eventId) {
   const { rows } = await client.query('SELECT * FROM event_projection WHERE event_id = $1 FOR UPDATE', [eventId]);
   return rows[0];
 }
@@ -103,6 +103,9 @@ export async function confirmAttendance(eventId, userId, correlationId) {
  * Quien la llama ya abrió la transacción. La usan el usuario y los handlers del inbox.
  */
 export async function revokeAttendance(client, { attendanceId, eventId, userId, reason, correlationId, causationId }) {
+  // El candado va antes de fijar cancelled_at: la hora tiene que ser posterior a la del conteo anterior.
+  // Si la transacción ya lo tenía (cancelación del usuario, event.cancelled), no espera nada.
+  await lockEvent(client, eventId);
   const cancelled = await client.query(
     // clock_timestamp() y no now(): la hora del cambio, ya con el candado del evento (ver migración 006).
     `UPDATE attendances SET status = 'cancelled', cancelled_at = clock_timestamp() WHERE id = $1 RETURNING cancelled_at`,

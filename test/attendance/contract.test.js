@@ -43,6 +43,7 @@ describe.skipIf(!fs.existsSync(schemaFile('attendance.confirmed')))('contratos d
     const client = {
       query: vi
         .fn()
+        .mockResolvedValueOnce({ rows: [{ event_id: EVENT_ID }] }) // candado del evento
         .mockResolvedValueOnce({ rows: [{ cancelled_at: new Date('2026-11-10T15:00:00Z') }] })
         .mockResolvedValueOnce({ rows: [{ id: PASS_ID }] })
         .mockResolvedValueOnce({ rows: [{ attendee_count: 0 }] }),
