@@ -173,4 +173,82 @@ describe.skipIf(!DB || !hasContracts)('booking-service con PostgreSQL', () => {
     const { rowCount } = await pool.query('SELECT 1 FROM attendances WHERE order_id = $1', [order.orderId]);
     expect(rowCount).toBe(0);
   });
+  describe('SCRUM-141: lista de asistentes para el organizador', () => {
+    const at = (minutesAgo) => new Date(Date.now() - minutesAgo * 60_000).toISOString();
+    const registered = (userId, displayName, minutesAgo) => ({
+      userId, email: `${userId}@example.com`, displayName, provider: 'email', role: 'user', registeredAt: at(minutesAgo),
+    });
+    const page = { limit: 50, offset: 0 };
+
+    it('el organizador ve a cada asistente con su nombre, sus boletas y si ya entró', async () => {
+      const event = eventSnapshot({ ticketed: true, priceCents: 1000 });
+      await run('event.published', event);
+      const ana = crypto.randomUUID();
+      const beto = crypto.randomUUID();
+      await run('account.registered', registered(ana, 'Ana', 60));
+      await run('profile.updated', { userId: ana, displayName: 'Ana María', interests: [], updatedAt: at(30) });
+      // Un registro que llega tarde no pisa el nombre más nuevo del perfil.
+      await run('account.registered', registered(ana, 'Ana', 60));
+
+      const order = (buyerId, quantity) => ({
+        orderId: crypto.randomUUID(), eventId: event.eventId, organizerId: ORGANIZER, buyerId, quantity,
+        unitPriceCents: 1000, subtotalCents: 1000 * quantity, commissionCents: 80 * quantity, totalCents: 1080 * quantity,
+        currency: 'COP', paymentMethod: 'NEQUI', providerTransactionId: 'tx', approvedAt: new Date().toISOString(),
+      });
+      await run('order.approved', order(ana, 2));
+      await run('order.approved', order(beto, 1)); // beto aún no tiene nombre en booking
+      const [anaPass] = (await passes.listMyPasses(ana)).filter((p) => p.eventId === event.eventId);
+      await passes.checkIn({ qr: anaPass.qr, eventId: event.eventId, scannedBy: ORGANIZER, role: 'merchant' });
+
+      const result = await attendance.listAttendees(event.eventId, ORGANIZER, 'merchant', page);
+      expect(result.outcome).toBe('ok');
+      expect(result.list).toMatchObject({ attendeeCount: 3, total: 2 });
+      expect(result.list.items).toEqual([
+        expect.objectContaining({ displayName: 'Ana María', source: 'ticket', tickets: 2, checkedIn: 1 }),
+        expect.objectContaining({ displayName: null, source: 'ticket', tickets: 1, checkedIn: 0 }),
+      ]);
+      // Solo el nombre visible: ni el correo ni el id de la persona salen en la lista.
+      const body = JSON.stringify(result.list);
+      expect(body).not.toContain('example.com');
+      expect(body).not.toContain(ana);
+    });
+
+    it('otro usuario recibe forbidden; un admin sí la ve; un evento inexistente da not_found', async () => {
+      const event = eventSnapshot();
+      await run('event.published', event);
+      await attendance.confirmAttendance(event.eventId, BUYER, null);
+
+      expect((await attendance.listAttendees(event.eventId, STRANGER, 'merchant', page)).outcome).toBe('forbidden');
+      expect((await attendance.listAttendees(event.eventId, BUYER, 'user', page)).outcome).toBe('forbidden');
+      expect((await attendance.listAttendees(event.eventId, STRANGER, 'admin', page)).outcome).toBe('ok');
+      expect((await attendance.listAttendees(crypto.randomUUID(), ORGANIZER, 'merchant', page)).outcome).toBe('not_found');
+    });
+
+    it('pagina en orden de confirmación y no muestra las asistencias canceladas', async () => {
+      const event = eventSnapshot();
+      await run('event.published', event);
+      const users = [crypto.randomUUID(), crypto.randomUUID(), crypto.randomUUID()];
+      for (const [i, userId] of users.entries()) {
+        await run('account.registered', registered(userId, `Persona ${i}`, 10));
+        await attendance.confirmAttendance(event.eventId, userId, null);
+      }
+      await attendance.cancelAttendance(event.eventId, users[1], null);
+
+      const page1 = await attendance.listAttendees(event.eventId, ORGANIZER, 'merchant', { limit: 1, offset: 0 });
+      const page2 = await attendance.listAttendees(event.eventId, ORGANIZER, 'merchant', { limit: 1, offset: 1 });
+      const past = await attendance.listAttendees(event.eventId, ORGANIZER, 'merchant', { limit: 1, offset: 5 });
+      expect(page1.list.items.map((a) => a.displayName)).toEqual(['Persona 0']);
+      expect(page2.list.items.map((a) => a.displayName)).toEqual(['Persona 2']);
+      expect([page1.list.total, page2.list.total, past.list.total]).toEqual([2, 2, 2]);
+      expect(past.list.items).toEqual([]);
+    });
+
+    it('al borrar la cuenta se borra también su nombre (Ley 1581)', async () => {
+      const userId = crypto.randomUUID();
+      await run('account.registered', registered(userId, 'Xime', 5));
+      await run('account.deleted', { userId, deletedAt: new Date().toISOString() });
+      const { rowCount } = await pool.query('SELECT 1 FROM user_names WHERE user_id = $1', [userId]);
+      expect(rowCount).toBe(0);
+    });
+  });
 });

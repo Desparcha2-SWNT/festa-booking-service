@@ -2,7 +2,7 @@ import { Router } from 'express';
 import rateLimit from 'express-rate-limit';
 import { z } from 'zod';
 import { requireAuth } from '../middleware/auth.js';
-import { cancelAttendance, confirmAttendance, getAttendanceStatus } from './repository.js';
+import { cancelAttendance, confirmAttendance, getAttendanceStatus, listAttendees } from './repository.js';
 
 export const attendanceRouter = Router();
 
@@ -56,6 +56,27 @@ attendanceRouter.get('/events/:id/attendance', handlers, async (req, res, next) 
     const status = await getAttendanceStatus(req.params.id, req.auth.userId);
     if (!status) return sendError(res, 'not_found');
     res.json(status);
+  } catch (err) {
+    next(err);
+  }
+});
+
+const pageSchema = z.object({
+  limit: z.coerce.number().int().min(1).max(200).default(50),
+  offset: z.coerce.number().int().min(0).default(0),
+});
+
+// SCRUM-141: lista de asistentes para el organizador del evento.
+attendanceRouter.get('/events/:id/attendees', handlers, async (req, res, next) => {
+  const page = pageSchema.safeParse(req.query);
+  if (!page.success) return res.status(400).json({ error: 'paginación inválida', issues: z.treeifyError(page.error) });
+  try {
+    const result = await listAttendees(req.params.id, req.auth.userId, req.auth.accountType, page.data);
+    if (result.outcome === 'not_found') return sendError(res, 'not_found');
+    if (result.outcome === 'forbidden') {
+      return res.status(403).json({ error: 'solo el organizador del evento puede ver sus asistentes', code: 'not_organizer' });
+    }
+    res.json(result.list);
   } catch (err) {
     next(err);
   }

@@ -12,6 +12,16 @@ async function closeEvent(client, eventId, status) {
   ]);
 }
 
+/** Guarda el nombre visible. Un mensaje más viejo que el guardado (llegó tarde) no lo pisa. */
+async function upsertName(client, userId, displayName, at) {
+  await client.query(
+    `INSERT INTO user_names (user_id, display_name, updated_at) VALUES ($1, $2, $3)
+     ON CONFLICT (user_id) DO UPDATE SET display_name = EXCLUDED.display_name, updated_at = EXCLUDED.updated_at
+     WHERE user_names.updated_at < EXCLUDED.updated_at`,
+    [userId, displayName, at],
+  );
+}
+
 /** event.published y event.updated traen el snapshot completo. Se ignora uno más viejo que el guardado. */
 async function upsertSnapshot(data, client) {
   const { rowCount } = await client.query('SELECT 1 FROM closed_events WHERE event_id = $1', [data.eventId]);
@@ -77,6 +87,15 @@ export const handlers = {
       });
     }
     await client.query('DELETE FROM attendances WHERE user_id = $1', [data.userId]);
+    await client.query('DELETE FROM user_names WHERE user_id = $1', [data.userId]);
+  },
+
+  // SCRUM-141: el nombre que ve el organizador en la lista de asistentes.
+  'account.registered': async (data, client) => {
+    await upsertName(client, data.userId, data.displayName, data.registeredAt);
+  },
+  'profile.updated': async (data, client) => {
+    await upsertName(client, data.userId, data.displayName, data.updatedAt);
   },
 
   // RF11 → RF10: pago aprobado. Crea la asistencia con un pase QR por boleta.
