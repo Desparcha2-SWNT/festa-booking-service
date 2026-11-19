@@ -13,10 +13,21 @@ async function closeEvent(client, eventId, status) {
 }
 
 /**
+ * Serializa por usuario los handlers que tocan su nombre. El consumidor procesa varios mensajes a la vez:
+ * sin esto, un account.display_name_set podía leer `deleted_users` antes de que se confirmara el borrado
+ * y recrear el nombre después. Con el candado, el que llega segundo espera y ve lo que hizo el primero.
+ * Es de transacción: se suelta solo con el COMMIT o el ROLLBACK.
+ */
+export async function lockUser(client, userId) {
+  await client.query(`SELECT pg_advisory_xact_lock(hashtext('booking.user_names'), hashtext($1))`, [userId]);
+}
+
+/**
  * Guarda el nombre visible. Un mensaje más viejo que el guardado (llegó tarde) no lo pisa, y el de una
  * cuenta ya borrada no se guarda: su id quedó en `deleted_users`.
  */
 async function upsertName(client, userId, displayName, at) {
+  await lockUser(client, userId);
   await client.query(
     `INSERT INTO user_names (user_id, display_name, updated_at)
      SELECT $1, $2, $3 WHERE NOT EXISTS (SELECT 1 FROM deleted_users WHERE user_id = $1)
@@ -77,6 +88,8 @@ export const handlers = {
 
   // Derecho de supresión (Ley 1581): libera sus cupos y borra sus asistencias y pases.
   'account.deleted': async (data, client, envelope) => {
+    // Primero el candado del usuario: un account.display_name_set concurrente espera a este borrado.
+    await lockUser(client, data.userId);
     const { rows } = await client.query(
       `SELECT id, event_id FROM attendances WHERE user_id = $1 AND status = 'confirmed' ORDER BY event_id`,
       [data.userId],

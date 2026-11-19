@@ -253,5 +253,45 @@ describe.skipIf(!DB || !hasContracts)('booking-service con PostgreSQL', () => {
       // Un account.deleted repetido no falla.
       await run('account.deleted', { userId, deletedAt: new Date().toISOString() });
     });
+
+    it('el nombre y el borrado de la misma cuenta se procesan uno después del otro, aunque lleguen a la vez', async () => {
+      const userId = crypto.randomUUID();
+      const nameOf = async () => (await pool.query('SELECT 1 FROM user_names WHERE user_id = $1', [userId])).rowCount;
+
+      /** Espera a que `waiters` conexiones queden esperando el candado del usuario que retiene `holderPid`. */
+      async function untilWaiting(holderPid, waiters) {
+        const deadline = Date.now() + 4_000;
+        while (Date.now() < deadline) {
+          const { rowCount } = await pool.query(
+            `SELECT 1 FROM pg_stat_activity WHERE wait_event = 'advisory' AND $1 = ANY(pg_blocking_pids(pid))`,
+            [holderPid],
+          );
+          if (rowCount >= waiters) return;
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        throw new Error('los handlers no esperaron el candado del usuario');
+      }
+
+      // Se retiene el candado del usuario y se lanzan los dos mensajes: si no lo pidieran, correrían a la
+      // vez y el nombre podía quedar guardado después del borrado. Así, el que va segundo ve al primero.
+      const holder = await pool.connect();
+      try {
+        await holder.query('BEGIN');
+        await holder.query(`SELECT pg_advisory_xact_lock(hashtext('booking.user_names'), hashtext($1))`, [userId]);
+        const { rows: me } = await holder.query('SELECT pg_backend_pid() AS pid');
+        const deleted = run('account.deleted', { userId, deletedAt: new Date().toISOString() });
+        const named = run('account.display_name_set', { userId, displayName: 'Xime', setAt: new Date().toISOString() });
+        deleted.catch(() => {});
+        named.catch(() => {});
+        await untilWaiting(me[0].pid, 2);
+        await holder.query('COMMIT');
+        await Promise.all([deleted, named]);
+      } finally {
+        holder.release();
+      }
+
+      // Sea cual sea el orden en que tomaron el candado, el nombre no queda guardado.
+      expect(await nameOf()).toBe(0);
+    });
   });
 });
