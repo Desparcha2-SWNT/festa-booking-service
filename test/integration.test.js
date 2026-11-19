@@ -175,9 +175,7 @@ describe.skipIf(!DB || !hasContracts)('booking-service con PostgreSQL', () => {
   });
   describe('SCRUM-141: lista de asistentes para el organizador', () => {
     const at = (minutesAgo) => new Date(Date.now() - minutesAgo * 60_000).toISOString();
-    const registered = (userId, displayName, minutesAgo) => ({
-      userId, email: `${userId}@example.com`, displayName, provider: 'email', role: 'user', registeredAt: at(minutesAgo),
-    });
+    const named = (userId, displayName, minutesAgo) => ({ userId, displayName, setAt: at(minutesAgo) });
     const page = { limit: 50, offset: 0 };
 
     it('el organizador ve a cada asistente con su nombre, sus boletas y si ya entró', async () => {
@@ -185,10 +183,10 @@ describe.skipIf(!DB || !hasContracts)('booking-service con PostgreSQL', () => {
       await run('event.published', event);
       const ana = crypto.randomUUID();
       const beto = crypto.randomUUID();
-      await run('account.registered', registered(ana, 'Ana', 60));
-      await run('profile.updated', { userId: ana, displayName: 'Ana María', interests: [], updatedAt: at(30) });
-      // Un registro que llega tarde no pisa el nombre más nuevo del perfil.
-      await run('account.registered', registered(ana, 'Ana', 60));
+      await run('account.display_name_set', named(ana, 'Ana', 60));
+      await run('account.display_name_set', named(ana, 'Ana María', 30));
+      // Un mensaje más viejo que llega tarde no pisa el nombre más nuevo.
+      await run('account.display_name_set', named(ana, 'Ana', 60));
 
       const order = (buyerId, quantity) => ({
         orderId: crypto.randomUUID(), eventId: event.eventId, organizerId: ORGANIZER, buyerId, quantity,
@@ -207,10 +205,8 @@ describe.skipIf(!DB || !hasContracts)('booking-service con PostgreSQL', () => {
         expect.objectContaining({ displayName: 'Ana María', source: 'ticket', tickets: 2, checkedIn: 1 }),
         expect.objectContaining({ displayName: null, source: 'ticket', tickets: 1, checkedIn: 0 }),
       ]);
-      // Solo el nombre visible: ni el correo ni el id de la persona salen en la lista.
-      const body = JSON.stringify(result.list);
-      expect(body).not.toContain('example.com');
-      expect(body).not.toContain(ana);
+      // Solo el nombre visible: el id de la persona no sale en la lista.
+      expect(JSON.stringify(result.list)).not.toContain(ana);
     });
 
     it('otro usuario recibe forbidden; un admin sí la ve; un evento inexistente da not_found', async () => {
@@ -229,7 +225,7 @@ describe.skipIf(!DB || !hasContracts)('booking-service con PostgreSQL', () => {
       await run('event.published', event);
       const users = [crypto.randomUUID(), crypto.randomUUID(), crypto.randomUUID()];
       for (const [i, userId] of users.entries()) {
-        await run('account.registered', registered(userId, `Persona ${i}`, 10));
+        await run('account.display_name_set', named(userId, `Persona ${i}`, 10));
         await attendance.confirmAttendance(event.eventId, userId, null);
       }
       await attendance.cancelAttendance(event.eventId, users[1], null);
@@ -243,12 +239,19 @@ describe.skipIf(!DB || !hasContracts)('booking-service con PostgreSQL', () => {
       expect(past.list.items).toEqual([]);
     });
 
-    it('al borrar la cuenta se borra también su nombre (Ley 1581)', async () => {
+    it('al borrar la cuenta se borra su nombre y un mensaje atrasado no lo recrea (Ley 1581)', async () => {
       const userId = crypto.randomUUID();
-      await run('account.registered', registered(userId, 'Xime', 5));
+      const nameOf = async () => (await pool.query('SELECT 1 FROM user_names WHERE user_id = $1', [userId])).rowCount;
+      await run('account.display_name_set', named(userId, 'Xime', 5));
       await run('account.deleted', { userId, deletedAt: new Date().toISOString() });
-      const { rowCount } = await pool.query('SELECT 1 FROM user_names WHERE user_id = $1', [userId]);
-      expect(rowCount).toBe(0);
+      expect(await nameOf()).toBe(0);
+
+      // Llega tarde, después del borrado, un mensaje con el nombre (anterior o incluso con hora posterior).
+      await run('account.display_name_set', named(userId, 'Xime', 10));
+      await run('account.display_name_set', named(userId, 'Xime', -5));
+      expect(await nameOf()).toBe(0);
+      // Un account.deleted repetido no falla.
+      await run('account.deleted', { userId, deletedAt: new Date().toISOString() });
     });
   });
 });
