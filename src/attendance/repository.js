@@ -101,6 +101,7 @@ export async function confirmAttendance(eventId, userId, correlationId) {
 /**
  * Cancela una asistencia, revoca sus pases, descuenta el cupo y encola `attendance.cancelled`.
  * Quien la llama ya abrió la transacción. La usan el usuario y los handlers del inbox.
+ * Devuelve el conteo nuevo, o `null` si la asistencia ya no estaba confirmada (no hace nada).
  */
 export async function revokeAttendance(client, { attendanceId, eventId, userId, reason, correlationId, causationId }) {
   // El candado va antes de fijar cancelled_at: la hora tiene que ser posterior a la del conteo anterior.
@@ -108,9 +109,14 @@ export async function revokeAttendance(client, { attendanceId, eventId, userId, 
   await lockEvent(client, eventId);
   const cancelled = await client.query(
     // clock_timestamp() y no now(): la hora del cambio, ya con el candado del evento (ver migración 006).
-    `UPDATE attendances SET status = 'cancelled', cancelled_at = clock_timestamp() WHERE id = $1 RETURNING cancelled_at`,
+    // Solo si sigue confirmada: el consumidor procesa varios mensajes a la vez, y otro handler
+    // (event.cancelled y account.deleted sobre la misma asistencia) pudo anularla mientras este
+    // esperaba el candado. Entonces no se descuenta otro cupo ni se publica otro attendance.cancelled.
+    `UPDATE attendances SET status = 'cancelled', cancelled_at = clock_timestamp()
+     WHERE id = $1 AND status = 'confirmed' RETURNING cancelled_at`,
     [attendanceId],
   );
+  if (cancelled.rowCount === 0) return null;
   const passes = await client.query(
     'UPDATE passes SET revoked_at = now() WHERE attendance_id = $1 AND revoked_at IS NULL RETURNING id',
     [attendanceId],
