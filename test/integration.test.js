@@ -173,4 +173,85 @@ describe.skipIf(!DB || !hasContracts)('booking-service con PostgreSQL', () => {
     const { rowCount } = await pool.query('SELECT 1 FROM attendances WHERE order_id = $1', [order.orderId]);
     expect(rowCount).toBe(0);
   });
+
+  describe('SCRUM-142: mis planes', () => {
+    const hoursFromNow = (h) => new Date(Date.now() + h * 3600_000).toISOString();
+
+    /** Publica un evento y confirma la asistencia del usuario mientras todavía está abierto. */
+    async function attend(userId, overrides = {}) {
+      const event = eventSnapshot(overrides);
+      await run('event.published', event);
+      expect((await attendance.confirmAttendance(event.eventId, userId, null)).outcome).toBe('confirmed');
+      return event;
+    }
+
+    /** Mueve el evento al pasado con un snapshot nuevo (no se puede confirmar en uno que ya terminó). */
+    async function finish(event) {
+      await run('event.updated', { ...event, version: 2, startsAt: hoursFromNow(-5), endsAt: hoursFromNow(-2) });
+    }
+
+    it('separa próximos y pasados, con lugar y portada, y deja fuera lo ajeno', async () => {
+      const me = crypto.randomUUID();
+      const later = await attend(me, { title: 'Después', startsAt: hoursFromNow(48), endsAt: hoursFromNow(50), coverImageUrl: 'https://img.test/a.jpg' });
+      const soon = await attend(me, { title: 'Pronto' });
+      const old = await attend(me, { title: 'Ya fue' });
+      await finish(old);
+
+      // Lo que no debe salir: un plan que el usuario canceló, el de otra persona y una entrada paga.
+      const dropped = await attend(me, { title: 'Cancelado por mí' });
+      expect((await attendance.cancelAttendance(dropped.eventId, me, null)).outcome).toBe('cancelled');
+      await attend(STRANGER, { title: 'De otro' });
+      const paid = eventSnapshot({ ticketed: true, priceCents: 1000 });
+      await run('event.published', paid);
+      await run('order.approved', {
+        orderId: crypto.randomUUID(), eventId: paid.eventId, organizerId: ORGANIZER, buyerId: me, quantity: 1,
+        unitPriceCents: 1000, subtotalCents: 1000, commissionCents: 80, totalCents: 1080, currency: 'COP',
+        paymentMethod: 'NEQUI', providerTransactionId: 'tx', approvedAt: new Date().toISOString(),
+      });
+
+      const upcoming = await attendance.listMyPlans(me, { when: 'upcoming', limit: 20, offset: 0 });
+      expect(upcoming.total).toBe(2);
+      expect(upcoming.items.map((p) => p.title)).toEqual(['Pronto', 'Después']);
+      expect(upcoming.items[1]).toMatchObject({
+        eventId: later.eventId,
+        venueName: 'Bloque G',
+        coverImageUrl: 'https://img.test/a.jpg',
+        status: 'confirmed',
+        eventStatus: 'published',
+      });
+      expect(upcoming.items[0].eventId).toBe(soon.eventId);
+      expect(upcoming.items[0].coverImageUrl).toBeNull();
+
+      const past = await attendance.listMyPlans(me, { when: 'past', limit: 20, offset: 0 });
+      expect(past.items.map((p) => p.title)).toEqual(['Ya fue']);
+    });
+
+    it('un plan anulado porque el organizador canceló el evento sigue en pasados, marcado', async () => {
+      const me = crypto.randomUUID();
+      const event = await attend(me, { title: 'Se canceló' });
+      // Otro plan del mismo evento que el usuario canceló antes no debe aparecer.
+      expect((await attendance.cancelAttendance(event.eventId, me, null)).outcome).toBe('cancelled');
+      expect((await attendance.confirmAttendance(event.eventId, me, null)).outcome).toBe('confirmed');
+      await run('event.cancelled', { eventId: event.eventId, version: 2, cancelledAt: new Date().toISOString() });
+
+      expect((await attendance.listMyPlans(me, { when: 'upcoming', limit: 20, offset: 0 })).total).toBe(0);
+      const past = await attendance.listMyPlans(me, { when: 'past', limit: 20, offset: 0 });
+      expect(past.total).toBe(1);
+      expect(past.items[0]).toMatchObject({ eventId: event.eventId, status: 'event_cancelled', eventStatus: 'cancelled' });
+    });
+
+    it('pagina y da el total aunque la página pedida ya esté vacía', async () => {
+      const me = crypto.randomUUID();
+      for (const h of [3, 2, 1]) await attend(me, { startsAt: hoursFromNow(h), endsAt: hoursFromNow(h + 1) });
+
+      const first = await attendance.listMyPlans(me, { when: 'upcoming', limit: 2, offset: 0 });
+      expect(first.items).toHaveLength(2);
+      expect(first.total).toBe(3);
+      const second = await attendance.listMyPlans(me, { when: 'upcoming', limit: 2, offset: 2 });
+      expect(second.items).toHaveLength(1);
+      expect(new Set([...first.items, ...second.items].map((p) => p.eventId)).size).toBe(3);
+      const beyond = await attendance.listMyPlans(me, { when: 'upcoming', limit: 2, offset: 10 });
+      expect(beyond).toMatchObject({ items: [], total: 3 });
+    });
+  });
 });
