@@ -253,5 +253,75 @@ describe.skipIf(!DB || !hasContracts)('booking-service con PostgreSQL', () => {
       const beyond = await attendance.listMyPlans(me, { when: 'upcoming', limit: 2, offset: 10 });
       expect(beyond).toMatchObject({ items: [], total: 3 });
     });
+
+    // «Mis planes» separa lo que canceló el usuario de lo que anuló el organizador al cancelar el evento con
+    // `cancelled_at >= closed_at`. Eso solo es cierto si las dos operaciones toman el candado del evento ANTES de
+    // fijar su hora. Se retiene el candado de la fila del evento, se lanzan las dos operaciones en un orden
+    // conocido y se suelta: el orden en que quedan esperando es el orden en que lo toman.
+    describe('concurrencia: cancelación del usuario frente a event.cancelled', () => {
+      /** Espera a que haya `waiters` conexiones esperando un candado en esta base. */
+      async function untilWaiting(waiters) {
+        const deadline = Date.now() + 5_000;
+        while (Date.now() < deadline) {
+          const { rows } = await pool.query(
+            `SELECT count(*)::int AS n FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND pid <> pg_backend_pid()`,
+          );
+          if (rows[0].n >= waiters) return;
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        throw new Error('las operaciones no esperaron el candado del evento');
+      }
+
+      /** Retiene el candado del evento, lanza `first` y luego `second` (cada una queda esperando) y lo suelta. */
+      async function race(eventId, first, second) {
+        const holder = await pool.connect();
+        try {
+          await holder.query('BEGIN');
+          await holder.query('SELECT 1 FROM event_projection WHERE event_id = $1 FOR UPDATE', [eventId]);
+          const a = first();
+          a.catch(() => {});
+          await untilWaiting(1);
+          const b = second();
+          b.catch(() => {});
+          await untilWaiting(2);
+          await holder.query('COMMIT');
+          return await Promise.all([a, b]);
+        } finally {
+          holder.release();
+        }
+      }
+
+      const cancelEvent = (event) => () => run('event.cancelled', { eventId: event.eventId, version: 2, cancelledAt: new Date().toISOString() });
+      const userCancels = (event, userId) => () => attendance.cancelAttendance(event.eventId, userId, null);
+      const plans = (userId, when) => attendance.listMyPlans(userId, { when, limit: 20, offset: 0 });
+
+      it('si el usuario cancela primero, el plan no aparece: lo canceló él, no el organizador', async () => {
+        const me = crypto.randomUUID();
+        const event = eventSnapshot();
+        await run('event.published', event);
+        expect((await attendance.confirmAttendance(event.eventId, me, null)).outcome).toBe('confirmed');
+
+        const [userResult] = await race(event.eventId, userCancels(event, me), cancelEvent(event));
+        expect(userResult.outcome).toBe('cancelled');
+
+        expect((await plans(me, 'upcoming')).total).toBe(0);
+        expect((await plans(me, 'past')).total).toBe(0);
+      });
+
+      it('si el evento se cancela primero, el plan queda en pasados como event_cancelled', async () => {
+        const me = crypto.randomUUID();
+        const event = eventSnapshot();
+        await run('event.published', event);
+        expect((await attendance.confirmAttendance(event.eventId, me, null)).outcome).toBe('confirmed');
+
+        const [, userResult] = await race(event.eventId, cancelEvent(event), userCancels(event, me));
+        expect(userResult.outcome).toBe('not_attending');
+
+        expect((await plans(me, 'upcoming')).total).toBe(0);
+        const past = await plans(me, 'past');
+        expect(past.total).toBe(1);
+        expect(past.items[0]).toMatchObject({ eventId: event.eventId, status: 'event_cancelled', eventStatus: 'cancelled' });
+      });
+    });
   });
 });
