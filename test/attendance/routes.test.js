@@ -8,6 +8,7 @@ const repo = vi.hoisted(() => ({
   confirmAttendance: vi.fn(),
   cancelAttendance: vi.fn(),
   getAttendanceStatus: vi.fn(),
+  listMyPlans: vi.fn(),
   listAttendees: vi.fn(),
 }));
 
@@ -150,5 +151,40 @@ describe('GET lista de asistentes (SCRUM-141)', () => {
     repo.listAttendees.mockResolvedValue({ outcome: 'not_found' });
     const res = await auth(request(createApp()).get(LIST_URL));
     expect(res.status).toBe(404);
+  });
+});
+
+describe('GET mis planes (SCRUM-142)', () => {
+  const PLANS = '/bookings/attendances/mine';
+  const page = { when: 'upcoming', total: 0, limit: 20, offset: 0, items: [] };
+
+  it('rechaza sin token', async () => {
+    const res = await request(createApp()).get(PLANS);
+    expect(res.status).toBe(401);
+  });
+
+  it('por defecto pide los próximos, 20 por página, del usuario del token', async () => {
+    repo.listMyPlans.mockResolvedValue(page);
+    const res = await auth(request(createApp()).get(PLANS));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(page);
+    expect(repo.listMyPlans).toHaveBeenCalledWith(USER_ID, { when: 'upcoming', limit: 20, offset: 0 });
+  });
+
+  it('pasa la pestaña y la página pedidas', async () => {
+    repo.listMyPlans.mockResolvedValue({ ...page, when: 'past', offset: 40 });
+    const res = await auth(request(createApp()).get(`${PLANS}?when=past&limit=10&offset=40`));
+
+    expect(res.status).toBe(200);
+    expect(repo.listMyPlans).toHaveBeenCalledWith(USER_ID, { when: 'past', limit: 10, offset: 40 });
+  });
+
+  it.each(['when=all', 'limit=0', 'limit=101', 'offset=-1', 'limit=abc'])('da 400 con %s', async (qs) => {
+    const res = await auth(request(createApp()).get(`${PLANS}?${qs}`));
+
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe('invalid_query');
+    expect(repo.listMyPlans).not.toHaveBeenCalled();
   });
 });

@@ -1,15 +1,22 @@
-import { revokeAttendance } from '../attendance/repository.js';
+import { lockEvent, revokeAttendance } from '../attendance/repository.js';
 import { issueTickets, revokeOrder } from '../passes/repository.js';
 
 // Un handler por tipo de mensaje consumido. Recibe `data` del sobre, el `client` de una transacción
 // ya abierta y el `envelope` completo. Lo que no tenga handler se confirma sin efecto.
 
-/** Marca el evento como cerrado: un snapshot posterior no lo vuelve a publicar. */
+/**
+ * Marca el evento como cerrado: un snapshot posterior no lo vuelve a publicar.
+ * `closed_at` es la hora real del cierre (clock_timestamp), no el inicio de la transacción: quien lo
+ * llama toma antes el candado del evento, así una cancelación del usuario que llegó primero queda antes.
+ */
 async function closeEvent(client, eventId, status) {
-  await client.query(`INSERT INTO closed_events (event_id, status) VALUES ($1, $2) ON CONFLICT (event_id) DO NOTHING`, [
-    eventId,
-    status,
-  ]);
+  await client.query(
+    `INSERT INTO closed_events (event_id, status, closed_at) VALUES ($1, $2, clock_timestamp()) ON CONFLICT (event_id) DO NOTHING`,
+    [
+      eventId,
+      status,
+    ],
+  );
 }
 
 /**
@@ -42,14 +49,28 @@ async function upsertSnapshot(data, client) {
   const { rowCount } = await client.query('SELECT 1 FROM closed_events WHERE event_id = $1', [data.eventId]);
   if (rowCount > 0) return; // evento cancelado o expirado: un snapshot retrasado no lo reabre
   await client.query(
-    `INSERT INTO event_projection (event_id, title, starts_at, ends_at, capacity, ticketed, status, version, organizer_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    `INSERT INTO event_projection
+       (event_id, title, starts_at, ends_at, capacity, ticketed, status, version, organizer_id, venue_name, cover_image_url)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
      ON CONFLICT (event_id) DO UPDATE SET
        organizer_id = EXCLUDED.organizer_id, title = EXCLUDED.title, starts_at = EXCLUDED.starts_at, ends_at = EXCLUDED.ends_at,
        capacity = EXCLUDED.capacity, ticketed = EXCLUDED.ticketed, status = EXCLUDED.status,
+       venue_name = EXCLUDED.venue_name, cover_image_url = EXCLUDED.cover_image_url,
        version = EXCLUDED.version, updated_at = now()
      WHERE event_projection.version < EXCLUDED.version`,
-    [data.eventId, data.title, data.startsAt, data.endsAt, data.capacity, data.ticketed, data.status, data.version, data.organizerId],
+    [
+      data.eventId,
+      data.title,
+      data.startsAt,
+      data.endsAt,
+      data.capacity,
+      data.ticketed,
+      data.status,
+      data.version,
+      data.organizerId,
+      data.venue?.name ?? null,
+      data.coverImageUrl ?? null,
+    ],
   );
 }
 
@@ -66,6 +87,8 @@ export const handlers = {
 
   // contracts/README.md § Evento cancelado: se revocan los pases y se avisa por cada asistente.
   'event.cancelled': async (data, client, envelope) => {
+    // Primero el candado del evento: así el cierre y las cancelaciones de usuarios quedan ordenados.
+    await lockEvent(client, data.eventId);
     await closeEvent(client, data.eventId, 'cancelled');
     await client.query(
       `UPDATE event_projection SET status = 'cancelled', version = GREATEST(version, $2), updated_at = now()
