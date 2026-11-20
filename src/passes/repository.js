@@ -1,7 +1,7 @@
 import { pool, withTransaction } from '../db/pool.js';
 import { config } from '../config.js';
 import { enqueue } from '../messaging/outboxRepository.js';
-import { revokeAttendance, toConfirmedMessage } from '../attendance/repository.js';
+import { lockEvent, revokeAttendance, toConfirmedMessage } from '../attendance/repository.js';
 import { parseQr, qrFor } from './qr.js';
 
 const EXCHANGE = 'festa.booking';
@@ -166,22 +166,28 @@ export async function issueTickets(client, order, causationId) {
     passIds.push(pass.rows[0].id);
   }
   const counted = await client.query(
-    `UPDATE event_projection SET attendee_count = attendee_count + $2, updated_at = now() WHERE event_id = $1 RETURNING attendee_count`,
+    `UPDATE event_projection SET attendee_count = attendee_count + $2, attendance_version = attendance_version + 1, updated_at = now() WHERE event_id = $1 RETURNING attendee_count, attendance_version`,
     [order.eventId, order.quantity],
   );
   await enqueue(client, {
     exchange: EXCHANGE,
     routingKey: 'attendance.confirmed',
-    payload: toConfirmedMessage(event, { ...attendance, pass_ids: passIds }, order.buyerId, counted.rows[0].attendee_count, {
-      source: 'ticket',
-      orderId: order.orderId,
-    }),
+    payload: {
+      ...toConfirmedMessage(event, { ...attendance, pass_ids: passIds }, order.buyerId, counted.rows[0].attendee_count, {
+        source: 'ticket',
+        orderId: order.orderId,
+      }),
+      attendanceVersion: counted.rows[0].attendance_version,
+    },
     causationId,
   });
 }
 
 /** order.refunded: revoca la asistencia (y sus pases) de esa orden. */
 export async function revokeOrder(client, refund, causationId) {
+  // Primero el evento y después la asistencia, el mismo orden que event.cancelled: al revés, un
+  // reembolso y una cancelación simultáneos se esperarían el uno al otro.
+  await lockEvent(client, refund.eventId);
   const { rows } = await client.query(`SELECT id, user_id FROM attendances WHERE order_id = $1 AND status = 'confirmed' FOR UPDATE`, [
     refund.orderId,
   ]);

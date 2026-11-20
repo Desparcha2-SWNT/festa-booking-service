@@ -173,4 +173,143 @@ describe.skipIf(!DB || !hasContracts)('booking-service con PostgreSQL', () => {
     const { rowCount } = await pool.query('SELECT 1 FROM attendances WHERE order_id = $1', [order.orderId]);
     expect(rowCount).toBe(0);
   });
+
+  // event-service ordena los conteos por confirmedAt / cancelledAt: si la hora se fijara antes de tener el
+  // candado del evento, una transacción que lo esperó publicaría el conteo más nuevo con una hora más vieja.
+  describe('la hora de confirmar y cancelar es posterior al candado del evento', () => {
+    /**
+     * Espera a que `waiters` conexiones queden esperando el candado de fila (no basta con dejar pasar tiempo).
+     * La primera espera a quien retiene el evento; las siguientes, a la que está antes en la fila, así que se
+     * cuenta cualquier espera cuya cadena de bloqueo llegue a `holderPid`.
+     */
+    async function untilSomeoneWaits(holderPid, waiters = 1) {
+      const deadline = Date.now() + 5_000;
+      while (Date.now() < deadline) {
+        const { rowCount } = await pool.query(
+          `WITH RECURSIVE chain AS (
+             SELECT pid FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND $1 = ANY(pg_blocking_pids(pid))
+             UNION
+             SELECT a.pid FROM pg_stat_activity a JOIN chain c ON c.pid = ANY(pg_blocking_pids(a.pid))
+             WHERE a.wait_event_type = 'Lock'
+           )
+           SELECT pid FROM chain`,
+          [holderPid],
+        );
+        if (rowCount >= waiters) return;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      throw new Error('ninguna consulta llegó a esperar el candado del evento');
+    }
+
+    /** Retiene el evento con FOR UPDATE, lanza la acción, espera a que quede bloqueada y libera. */
+    async function whileLocked(eventId, action) {
+      const holder = await pool.connect();
+      try {
+        await holder.query('BEGIN');
+        await holder.query('SELECT 1 FROM event_projection WHERE event_id = $1 FOR UPDATE', [eventId]);
+        const { rows: me } = await holder.query('SELECT pg_backend_pid() AS pid');
+        const pending = action();
+        pending.catch(() => {}); // el error, si lo hay, se ve en el await de abajo
+        await untilSomeoneWaits(me[0].pid);
+        const { rows } = await holder.query('SELECT clock_timestamp() AS t');
+        await holder.query('COMMIT');
+        return { result: await pending, releasedAt: rows[0].t.getTime() };
+      } finally {
+        holder.release();
+      }
+    }
+
+    /**
+     * Como whileLocked, pero con varias acciones que quedan en fila esperando el candado, en el orden dado:
+     * cada una se lanza cuando la anterior ya está esperando. PostgreSQL entrega el candado en ese orden.
+     */
+    async function whileLockedInOrder(eventId, actions) {
+      const holder = await pool.connect();
+      try {
+        await holder.query('BEGIN');
+        await holder.query('SELECT 1 FROM event_projection WHERE event_id = $1 FOR UPDATE', [eventId]);
+        const { rows: me } = await holder.query('SELECT pg_backend_pid() AS pid');
+        const pending = [];
+        for (const [i, action] of actions.entries()) {
+          const p = action();
+          p.catch(() => {});
+          pending.push(p);
+          await untilSomeoneWaits(me[0].pid, i + 1);
+        }
+        await holder.query('COMMIT');
+        return await Promise.all(pending);
+      } finally {
+        holder.release();
+      }
+    }
+
+    const cancelledOf = async (attendanceId) =>
+      (await outbox('attendance.cancelled')).find((m) => m.attendanceId === attendanceId);
+
+    it('RSVP: confirmar y cancelar', async () => {
+      const event = eventSnapshot();
+      await run('event.published', event);
+
+      const confirmed = await whileLocked(event.eventId, () => attendance.confirmAttendance(event.eventId, STRANGER, null));
+      expect(confirmed.result.outcome).toBe('confirmed');
+      const confirmMsg = (await outbox('attendance.confirmed')).find((m) => m.eventId === event.eventId && m.userId === STRANGER);
+      expect(new Date(confirmMsg.confirmedAt).getTime()).toBeGreaterThanOrEqual(confirmed.releasedAt);
+
+      const cancelled = await whileLocked(event.eventId, () => attendance.cancelAttendance(event.eventId, STRANGER, null));
+      expect(cancelled.result.outcome).toBe('cancelled');
+      const cancelMsg = await cancelledOf(confirmed.result.attendance.attendanceId);
+      expect(new Date(cancelMsg.cancelledAt).getTime()).toBeGreaterThanOrEqual(cancelled.releasedAt);
+    });
+
+    it('order.refunded', async () => {
+      const event = eventSnapshot({ ticketed: true, priceCents: 1000 });
+      await run('event.published', event);
+      const order = {
+        orderId: crypto.randomUUID(), eventId: event.eventId, organizerId: ORGANIZER, buyerId: BUYER, quantity: 1,
+        unitPriceCents: 1000, subtotalCents: 1000, commissionCents: 80, totalCents: 1080, currency: 'COP',
+        paymentMethod: 'NEQUI', providerTransactionId: 'tx', approvedAt: new Date().toISOString(),
+      };
+      await run('order.approved', order);
+      const { rows } = await pool.query('SELECT id FROM attendances WHERE order_id = $1', [order.orderId]);
+
+      const refund = { orderId: order.orderId, eventId: event.eventId, buyerId: BUYER, amountCents: 1080, refundedBy: ORGANIZER, refundedAt: new Date().toISOString() };
+      const { releasedAt } = await whileLocked(event.eventId, () => run('order.refunded', refund));
+      const cancelMsg = await cancelledOf(rows[0].id);
+      expect(cancelMsg).toMatchObject({ reason: 'refunded', attendeeCount: 0 });
+      expect(new Date(cancelMsg.cancelledAt).getTime()).toBeGreaterThanOrEqual(releasedAt);
+    });
+
+    it('account.deleted', async () => {
+      const event = eventSnapshot();
+      await run('event.published', event);
+      const userId = crypto.randomUUID();
+      const confirmed = await attendance.confirmAttendance(event.eventId, userId, null);
+
+      const { releasedAt } = await whileLocked(event.eventId, () => run('account.deleted', { userId, deletedAt: new Date().toISOString() }));
+      const cancelMsg = await cancelledOf(confirmed.attendance.attendanceId);
+      expect(cancelMsg).toMatchObject({ reason: 'account_deleted', attendeeCount: 0 });
+      expect(new Date(cancelMsg.cancelledAt).getTime()).toBeGreaterThanOrEqual(releasedAt);
+    });
+
+    it('event.cancelled y account.deleted a la vez sobre la misma asistencia: se anula una sola vez', async () => {
+      const event = eventSnapshot();
+      await run('event.published', event);
+      const userId = crypto.randomUUID();
+      const confirmed = await attendance.confirmAttendance(event.eventId, userId, null);
+      const attendanceId = confirmed.attendance.attendanceId;
+
+      // Los dos leen la asistencia como confirmada mientras el evento está retenido; event.cancelled
+      // queda primero en la fila del candado, así que account.deleted llega cuando ya está anulada.
+      await whileLockedInOrder(event.eventId, [
+        () => run('event.cancelled', { eventId: event.eventId, version: 2, cancelledAt: new Date().toISOString() }),
+        () => run('account.deleted', { userId, deletedAt: new Date().toISOString() }),
+      ]);
+
+      const messages = (await outbox('attendance.cancelled')).filter((m) => m.attendanceId === attendanceId);
+      expect(messages).toHaveLength(1);
+      expect(messages[0]).toMatchObject({ reason: 'event_cancelled', attendeeCount: 0 });
+      const { rows } = await pool.query('SELECT attendee_count FROM event_projection WHERE event_id = $1', [event.eventId]);
+      expect(rows[0].attendee_count).toBe(0);
+    });
+  });
 });

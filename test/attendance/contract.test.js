@@ -28,14 +28,16 @@ const PASS_ID = 'f6a7b8c9-d0e1-4f2a-8b3c-4d5e6f7a8b9c';
 describe.skipIf(!fs.existsSync(schemaFile('attendance.confirmed')))('contratos de asistencia', () => {
   it('attendance.confirmed valida contra el esquema', () => {
     const validate = validator('attendance.confirmed');
-    validate(
-      toConfirmedMessage(
+    // Igual que los llamadores (confirmAttendance e issueTickets): el mensaje lleva además la versión del conteo.
+    validate({
+      ...toConfirmedMessage(
         { event_id: EVENT_ID, title: 'Noche de jazz', starts_at: new Date('2099-01-01T01:00:00Z') },
         { id: ATTENDANCE_ID, pass_ids: [PASS_ID], confirmed_at: new Date('2026-11-10T15:00:00Z') },
         USER_ID,
         1,
       ),
-    );
+      attendanceVersion: 7,
+    });
     expect(validate.errors, JSON.stringify(validate.errors, null, 2)).toBeNull();
   });
 
@@ -43,9 +45,10 @@ describe.skipIf(!fs.existsSync(schemaFile('attendance.confirmed')))('contratos d
     const client = {
       query: vi
         .fn()
+        .mockResolvedValueOnce({ rows: [{ event_id: EVENT_ID }] }) // candado del evento
         .mockResolvedValueOnce({ rows: [{ cancelled_at: new Date('2026-11-10T15:00:00Z') }] })
         .mockResolvedValueOnce({ rows: [{ id: PASS_ID }] })
-        .mockResolvedValueOnce({ rows: [{ attendee_count: 0 }] }),
+        .mockResolvedValueOnce({ rows: [{ attendee_count: 0, attendance_version: 8 }] }),
     };
     h.enqueue.mockClear();
     await revokeAttendance(client, { attendanceId: ATTENDANCE_ID, eventId: EVENT_ID, userId: USER_ID, reason });
