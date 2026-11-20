@@ -1,5 +1,7 @@
 import { pool } from '../db/pool.js';
+import { config } from '../config.js';
 import { logger } from '../logger.js';
+import { getSchemaRegistry } from './schemaRegistry.js';
 
 /**
  * Publica lo pendiente en `outbox` con publisher confirms (ver contracts/README.md § Publicar).
@@ -13,6 +15,7 @@ import { logger } from '../logger.js';
  */
 export function startOutboxPublisher(connection, { intervalMs = 2000 } = {}) {
   let stopped = false;
+  const registry = getSchemaRegistry(config.contractsDir);
   let channelPromise = connection.createConfirmChannel();
 
   const tick = async () => {
@@ -30,7 +33,8 @@ export function startOutboxPublisher(connection, { intervalMs = 2000 } = {}) {
         const envelope = {
           eventId: row.event_id,
           eventType: row.routing_key,
-          version: 1,
+          // Versión del esquema de `data` (x-version del catálogo): attendance.* ya es 2, el resto sigue en 1.
+          version: registry.getVersion(row.routing_key),
           // Cuándo ocurrió el hecho (la fila del outbox), no cuándo se publica: un reintento conserva la misma fecha.
           occurredAt: new Date(row.created_at).toISOString(),
           producer: 'booking-service',
