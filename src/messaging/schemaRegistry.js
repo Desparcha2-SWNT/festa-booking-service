@@ -21,6 +21,7 @@ function build(contractsDir) {
   const dataValidators = new Map();
   const producers = new Map();
   const exchanges = new Map();
+  const versions = new Map();
   const eventsDir = path.join(contractsDir, 'events');
   for (const domain of fs.readdirSync(eventsDir)) {
     const domainDir = path.join(eventsDir, domain);
@@ -31,6 +32,7 @@ function build(contractsDir) {
       dataValidators.set(schema['x-routing-key'], ajv.compile(schema));
       producers.set(schema['x-routing-key'], schema['x-producer']);
       exchanges.set(schema['x-routing-key'], schema['x-exchange']);
+      versions.set(schema['x-routing-key'], schema['x-version']);
     }
   }
 
@@ -49,6 +51,11 @@ function build(contractsDir) {
     getExpectedProducer: (eventType) => producers.get(eventType),
     /** El exchange real (`msg.fields.exchange` de amqplib) por el que debió llegar este eventType. */
     getExpectedExchange: (eventType) => exchanges.get(eventType),
+    /**
+     * El `x-version` del esquema de `data` de ese eventType: es lo que el sobre declara en `version`
+     * (envelope.schema.json). 1 si el catálogo no lo trae.
+     */
+    getVersion: (eventType) => versions.get(eventType) ?? 1,
   };
 }
 
