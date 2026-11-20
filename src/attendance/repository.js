@@ -7,7 +7,7 @@ const EXCHANGE = 'festa.booking';
  * Toma el candado de la fila del evento. Todas las operaciones que cambian el conteo pasan por
  * aquí, así dos confirmaciones simultáneas no pueden ocupar el mismo último cupo.
  */
-async function lockEvent(client, eventId) {
+export async function lockEvent(client, eventId) {
   const { rows } = await client.query('SELECT * FROM event_projection WHERE event_id = $1 FOR UPDATE', [eventId]);
   return rows[0];
 }
@@ -80,8 +80,8 @@ export async function confirmAttendance(eventId, userId, correlationId) {
       [row.id, eventId, userId],
     );
     const counted = await client.query(
-      `UPDATE event_projection SET attendee_count = attendee_count + 1, updated_at = now()
-       WHERE event_id = $1 RETURNING attendee_count`,
+      `UPDATE event_projection SET attendee_count = attendee_count + 1, attendance_version = attendance_version + 1, updated_at = now()
+       WHERE event_id = $1 RETURNING attendee_count, attendance_version`,
       [eventId],
     );
 
@@ -90,7 +90,10 @@ export async function confirmAttendance(eventId, userId, correlationId) {
     await enqueue(client, {
       exchange: EXCHANGE,
       routingKey: 'attendance.confirmed',
-      payload: toConfirmedMessage(event, attendance, userId, attendeeCount),
+      payload: {
+        ...toConfirmedMessage(event, attendance, userId, attendeeCount),
+        attendanceVersion: counted.rows[0].attendance_version,
+      },
       correlationId,
     });
 
@@ -101,12 +104,22 @@ export async function confirmAttendance(eventId, userId, correlationId) {
 /**
  * Cancela una asistencia, revoca sus pases, descuenta el cupo y encola `attendance.cancelled`.
  * Quien la llama ya abrió la transacción. La usan el usuario y los handlers del inbox.
+ * Devuelve el conteo nuevo, o `null` si la asistencia ya no estaba confirmada (no hace nada).
  */
 export async function revokeAttendance(client, { attendanceId, eventId, userId, reason, correlationId, causationId }) {
+  // El candado va antes de fijar cancelled_at: la hora tiene que ser posterior a la del conteo anterior.
+  // Si la transacción ya lo tenía (cancelación del usuario, event.cancelled), no espera nada.
+  await lockEvent(client, eventId);
   const cancelled = await client.query(
-    `UPDATE attendances SET status = 'cancelled', cancelled_at = now() WHERE id = $1 RETURNING cancelled_at`,
+    // clock_timestamp() y no now(): la hora del cambio, ya con el candado del evento (ver migración 006).
+    // Solo si sigue confirmada: el consumidor procesa varios mensajes a la vez, y otro handler
+    // (event.cancelled y account.deleted sobre la misma asistencia) pudo anularla mientras este
+    // esperaba el candado. Entonces no se descuenta otro cupo ni se publica otro attendance.cancelled.
+    `UPDATE attendances SET status = 'cancelled', cancelled_at = clock_timestamp()
+     WHERE id = $1 AND status = 'confirmed' RETURNING cancelled_at`,
     [attendanceId],
   );
+  if (cancelled.rowCount === 0) return null;
   const passes = await client.query(
     'UPDATE passes SET revoked_at = now() WHERE attendance_id = $1 AND revoked_at IS NULL RETURNING id',
     [attendanceId],
@@ -114,8 +127,8 @@ export async function revokeAttendance(client, { attendanceId, eventId, userId, 
   // Una asistencia con boletas ocupa un cupo por pase; un RSVP, uno solo.
   const seats = Math.max(passes.rows.length, 1);
   const counted = await client.query(
-    `UPDATE event_projection SET attendee_count = GREATEST(attendee_count - $2, 0), updated_at = now()
-     WHERE event_id = $1 RETURNING attendee_count`,
+    `UPDATE event_projection SET attendee_count = GREATEST(attendee_count - $2, 0), attendance_version = attendance_version + 1, updated_at = now()
+     WHERE event_id = $1 RETURNING attendee_count, attendance_version`,
     [eventId, seats],
   );
 
@@ -129,6 +142,7 @@ export async function revokeAttendance(client, { attendanceId, eventId, userId, 
       reason,
       revokedPassIds: passes.rows.map((p) => p.id),
       attendeeCount: counted.rows[0].attendee_count,
+      attendanceVersion: counted.rows[0].attendance_version,
       cancelledAt: cancelled.rows[0].cancelled_at.toISOString(),
     },
     correlationId,
