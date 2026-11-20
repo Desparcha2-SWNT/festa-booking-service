@@ -166,16 +166,19 @@ export async function issueTickets(client, order, causationId) {
     passIds.push(pass.rows[0].id);
   }
   const counted = await client.query(
-    `UPDATE event_projection SET attendee_count = attendee_count + $2, updated_at = now() WHERE event_id = $1 RETURNING attendee_count`,
+    `UPDATE event_projection SET attendee_count = attendee_count + $2, attendance_version = attendance_version + 1, updated_at = now() WHERE event_id = $1 RETURNING attendee_count, attendance_version`,
     [order.eventId, order.quantity],
   );
   await enqueue(client, {
     exchange: EXCHANGE,
     routingKey: 'attendance.confirmed',
-    payload: toConfirmedMessage(event, { ...attendance, pass_ids: passIds }, order.buyerId, counted.rows[0].attendee_count, {
-      source: 'ticket',
-      orderId: order.orderId,
-    }),
+    payload: {
+      ...toConfirmedMessage(event, { ...attendance, pass_ids: passIds }, order.buyerId, counted.rows[0].attendee_count, {
+        source: 'ticket',
+        orderId: order.orderId,
+      }),
+      attendanceVersion: counted.rows[0].attendance_version,
+    },
     causationId,
   });
 }

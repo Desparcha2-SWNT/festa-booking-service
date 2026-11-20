@@ -80,8 +80,8 @@ export async function confirmAttendance(eventId, userId, correlationId) {
       [row.id, eventId, userId],
     );
     const counted = await client.query(
-      `UPDATE event_projection SET attendee_count = attendee_count + 1, updated_at = now()
-       WHERE event_id = $1 RETURNING attendee_count`,
+      `UPDATE event_projection SET attendee_count = attendee_count + 1, attendance_version = attendance_version + 1, updated_at = now()
+       WHERE event_id = $1 RETURNING attendee_count, attendance_version`,
       [eventId],
     );
 
@@ -90,7 +90,10 @@ export async function confirmAttendance(eventId, userId, correlationId) {
     await enqueue(client, {
       exchange: EXCHANGE,
       routingKey: 'attendance.confirmed',
-      payload: toConfirmedMessage(event, attendance, userId, attendeeCount),
+      payload: {
+        ...toConfirmedMessage(event, attendance, userId, attendeeCount),
+        attendanceVersion: counted.rows[0].attendance_version,
+      },
       correlationId,
     });
 
@@ -124,8 +127,8 @@ export async function revokeAttendance(client, { attendanceId, eventId, userId, 
   // Una asistencia con boletas ocupa un cupo por pase; un RSVP, uno solo.
   const seats = Math.max(passes.rows.length, 1);
   const counted = await client.query(
-    `UPDATE event_projection SET attendee_count = GREATEST(attendee_count - $2, 0), updated_at = now()
-     WHERE event_id = $1 RETURNING attendee_count`,
+    `UPDATE event_projection SET attendee_count = GREATEST(attendee_count - $2, 0), attendance_version = attendance_version + 1, updated_at = now()
+     WHERE event_id = $1 RETURNING attendee_count, attendance_version`,
     [eventId, seats],
   );
 
@@ -139,6 +142,7 @@ export async function revokeAttendance(client, { attendanceId, eventId, userId, 
       reason,
       revokedPassIds: passes.rows.map((p) => p.id),
       attendeeCount: counted.rows[0].attendee_count,
+      attendanceVersion: counted.rows[0].attendance_version,
       cancelledAt: cancelled.rows[0].cancelled_at.toISOString(),
     },
     correlationId,
