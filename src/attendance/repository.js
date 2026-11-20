@@ -187,3 +187,128 @@ export async function getAttendanceStatus(eventId, userId) {
     passIds: mine?.pass_ids,
   };
 }
+
+/**
+ * SCRUM-141: la lista de asistentes confirmados de un evento, solo para su organizador (o un admin).
+ * Una fila por asistencia: un RSVP o una compra con sus boletas. El nombre es null si booking aún no
+ * recibió el registro o el perfil de esa persona.
+ */
+export async function listAttendees(eventId, requesterId, role, { limit, offset }) {
+  const { rows: events } = await pool.query(
+    'SELECT organizer_id, capacity, attendee_count FROM event_projection WHERE event_id = $1',
+    [eventId],
+  );
+  const event = events[0];
+  if (!event) return { outcome: 'not_found' };
+  if (role !== 'admin' && event.organizer_id !== requesterId) return { outcome: 'forbidden' };
+
+  const { rows } = await pool.query(
+    `SELECT a.id, a.source, a.confirmed_at, n.display_name,
+       COUNT(p.id) FILTER (WHERE p.revoked_at IS NULL)::int AS tickets,
+       COUNT(p.id) FILTER (WHERE p.used_at IS NOT NULL AND p.revoked_at IS NULL)::int AS checked_in,
+       COUNT(*) OVER ()::int AS total
+     FROM attendances a
+     LEFT JOIN passes p ON p.attendance_id = a.id
+     LEFT JOIN user_names n ON n.user_id = a.user_id
+     WHERE a.event_id = $1 AND a.status = 'confirmed'
+     GROUP BY a.id, n.display_name
+     ORDER BY a.confirmed_at, a.id
+     LIMIT $2 OFFSET $3`,
+    [eventId, limit, offset],
+  );
+  let total = rows[0]?.total;
+  if (total === undefined) {
+    // Página vacía (offset más allá del final): el total igual hace falta para paginar.
+    const counted = await pool.query(`SELECT COUNT(*)::int AS n FROM attendances WHERE event_id = $1 AND status = 'confirmed'`, [eventId]);
+    total = counted.rows[0].n;
+  }
+
+  return {
+    outcome: 'ok',
+    list: {
+      eventId,
+      capacity: event.capacity,
+      attendeeCount: event.attendee_count,
+      total,
+      limit,
+      offset,
+      items: rows.map((r) => ({
+        attendanceId: r.id,
+        displayName: r.display_name,
+        source: r.source,
+        tickets: r.tickets,
+        checkedIn: r.checked_in,
+        confirmedAt: r.confirmed_at.toISOString(),
+      })),
+    },
+  };
+}
+
+/**
+ * «Mis planes» (SCRUM-142): las asistencias gratis del usuario. Las entradas pagas van en /passes/mine.
+ *
+ * - `upcoming`: confirmadas de eventos que no han terminado, del más cercano al más lejano.
+ * - `past`: confirmadas de eventos que ya terminaron, más las que se anularon porque el organizador
+ *   canceló el evento (así el plan no desaparece sin explicación), del más reciente al más antiguo.
+ *
+ * Las que el usuario canceló él mismo no salen. Una anulación por evento cancelado se reconoce porque
+ * el evento quedó cancelado y la asistencia se anuló en la misma transacción que lo cerró o después
+ * (`cancelled_at >= closed_at`); las que el usuario canceló antes quedan con una hora anterior.
+ */
+export async function listMyPlans(userId, { when, limit, offset }) {
+  const upcoming = when === 'upcoming';
+  const { rows } = await pool.query(
+    `WITH plans AS (
+       SELECT a.id, a.event_id, a.confirmed_at, e.title, e.starts_at, e.ends_at, e.venue_name, e.cover_image_url,
+              e.status AS event_status, a.status = 'cancelled' AS cancelled_by_event,
+              a.status = 'confirmed' AND e.ends_at > now() AS is_upcoming
+       FROM attendances a
+       JOIN event_projection e ON e.event_id = a.event_id
+       LEFT JOIN closed_events c ON c.event_id = a.event_id AND c.status = 'cancelled'
+       WHERE a.user_id = $1 AND a.source = 'rsvp'
+         AND (a.status = 'confirmed' OR (c.event_id IS NOT NULL AND a.cancelled_at >= c.closed_at))
+     )
+     SELECT *, COUNT(*) OVER () AS total FROM plans
+     WHERE is_upcoming = $2
+     ORDER BY starts_at ${upcoming ? 'ASC' : 'DESC'}, id
+     LIMIT $3 OFFSET $4`,
+    [userId, upcoming, limit, offset],
+  );
+
+  let total = rows.length > 0 ? Number(rows[0].total) : 0;
+  if (rows.length === 0 && offset > 0) total = await countMyPlans(userId, upcoming);
+
+  return {
+    when,
+    total,
+    limit,
+    offset,
+    items: rows.map((r) => ({
+      attendanceId: r.id,
+      eventId: r.event_id,
+      title: r.title,
+      startsAt: r.starts_at.toISOString(),
+      endsAt: r.ends_at.toISOString(),
+      venueName: r.venue_name,
+      coverImageUrl: r.cover_image_url,
+      status: r.cancelled_by_event ? 'event_cancelled' : 'confirmed',
+      eventStatus: r.event_status,
+      confirmedAt: r.confirmed_at.toISOString(),
+    })),
+  };
+}
+
+/** Total de una pestaña cuando la página pedida ya quedó vacía (COUNT(*) OVER() no tiene filas). */
+async function countMyPlans(userId, upcoming) {
+  const { rows } = await pool.query(
+    `SELECT COUNT(*) AS total
+     FROM attendances a
+     JOIN event_projection e ON e.event_id = a.event_id
+     LEFT JOIN closed_events c ON c.event_id = a.event_id AND c.status = 'cancelled'
+     WHERE a.user_id = $1 AND a.source = 'rsvp'
+       AND (a.status = 'confirmed' OR (c.event_id IS NOT NULL AND a.cancelled_at >= c.closed_at))
+       AND (a.status = 'confirmed' AND e.ends_at > now()) = $2`,
+    [userId, upcoming],
+  );
+  return Number(rows[0].total);
+}
