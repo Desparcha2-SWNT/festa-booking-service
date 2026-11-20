@@ -187,3 +187,59 @@ export async function getAttendanceStatus(eventId, userId) {
     passIds: mine?.pass_ids,
   };
 }
+
+/**
+ * SCRUM-141: la lista de asistentes confirmados de un evento, solo para su organizador (o un admin).
+ * Una fila por asistencia: un RSVP o una compra con sus boletas. El nombre es null si booking aún no
+ * recibió el registro o el perfil de esa persona.
+ */
+export async function listAttendees(eventId, requesterId, role, { limit, offset }) {
+  const { rows: events } = await pool.query(
+    'SELECT organizer_id, capacity, attendee_count FROM event_projection WHERE event_id = $1',
+    [eventId],
+  );
+  const event = events[0];
+  if (!event) return { outcome: 'not_found' };
+  if (role !== 'admin' && event.organizer_id !== requesterId) return { outcome: 'forbidden' };
+
+  const { rows } = await pool.query(
+    `SELECT a.id, a.source, a.confirmed_at, n.display_name,
+       COUNT(p.id) FILTER (WHERE p.revoked_at IS NULL)::int AS tickets,
+       COUNT(p.id) FILTER (WHERE p.used_at IS NOT NULL AND p.revoked_at IS NULL)::int AS checked_in,
+       COUNT(*) OVER ()::int AS total
+     FROM attendances a
+     LEFT JOIN passes p ON p.attendance_id = a.id
+     LEFT JOIN user_names n ON n.user_id = a.user_id
+     WHERE a.event_id = $1 AND a.status = 'confirmed'
+     GROUP BY a.id, n.display_name
+     ORDER BY a.confirmed_at, a.id
+     LIMIT $2 OFFSET $3`,
+    [eventId, limit, offset],
+  );
+  let total = rows[0]?.total;
+  if (total === undefined) {
+    // Página vacía (offset más allá del final): el total igual hace falta para paginar.
+    const counted = await pool.query(`SELECT COUNT(*)::int AS n FROM attendances WHERE event_id = $1 AND status = 'confirmed'`, [eventId]);
+    total = counted.rows[0].n;
+  }
+
+  return {
+    outcome: 'ok',
+    list: {
+      eventId,
+      capacity: event.capacity,
+      attendeeCount: event.attendee_count,
+      total,
+      limit,
+      offset,
+      items: rows.map((r) => ({
+        attendanceId: r.id,
+        displayName: r.display_name,
+        source: r.source,
+        tickets: r.tickets,
+        checkedIn: r.checked_in,
+        confirmedAt: r.confirmed_at.toISOString(),
+      })),
+    },
+  };
+}
