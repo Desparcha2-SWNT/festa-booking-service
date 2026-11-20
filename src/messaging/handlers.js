@@ -1,15 +1,22 @@
-import { revokeAttendance } from '../attendance/repository.js';
+import { lockEvent, revokeAttendance } from '../attendance/repository.js';
 import { issueTickets, revokeOrder } from '../passes/repository.js';
 
 // Un handler por tipo de mensaje consumido. Recibe `data` del sobre, el `client` de una transacción
 // ya abierta y el `envelope` completo. Lo que no tenga handler se confirma sin efecto.
 
-/** Marca el evento como cerrado: un snapshot posterior no lo vuelve a publicar. */
+/**
+ * Marca el evento como cerrado: un snapshot posterior no lo vuelve a publicar.
+ * `closed_at` es la hora real del cierre (clock_timestamp), no el inicio de la transacción: quien lo
+ * llama toma antes el candado del evento, así una cancelación del usuario que llegó primero queda antes.
+ */
 async function closeEvent(client, eventId, status) {
-  await client.query(`INSERT INTO closed_events (event_id, status) VALUES ($1, $2) ON CONFLICT (event_id) DO NOTHING`, [
-    eventId,
-    status,
-  ]);
+  await client.query(
+    `INSERT INTO closed_events (event_id, status, closed_at) VALUES ($1, $2, clock_timestamp()) ON CONFLICT (event_id) DO NOTHING`,
+    [
+      eventId,
+      status,
+    ],
+  );
 }
 
 /** event.published y event.updated traen el snapshot completo. Se ignora uno más viejo que el guardado. */
@@ -55,6 +62,8 @@ export const handlers = {
 
   // contracts/README.md § Evento cancelado: se revocan los pases y se avisa por cada asistente.
   'event.cancelled': async (data, client, envelope) => {
+    // Primero el candado del evento: así el cierre y las cancelaciones de usuarios quedan ordenados.
+    await lockEvent(client, data.eventId);
     await closeEvent(client, data.eventId, 'cancelled');
     await client.query(
       `UPDATE event_projection SET status = 'cancelled', version = GREATEST(version, $2), updated_at = now()
