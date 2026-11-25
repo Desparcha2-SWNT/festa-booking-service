@@ -108,6 +108,75 @@ describe.skipIf(!DB || !hasContracts)('booking-service con PostgreSQL', () => {
     expect(result.reason).toBe('outside_window');
   });
 
+  // SCRUM-95: QR inválido, de otro evento y de un pase cancelado. Cada rechazo deja el pase como estaba y
+  // publica pass.check_in_rejected según el contrato.
+  describe('QR que no deben entrar (SCRUM-95)', () => {
+    const scan = (qr, eventId) => passes.checkIn({ qr, eventId, scannedBy: ORGANIZER, role: 'merchant' });
+
+    async function freshPass(event, userId = BUYER) {
+      await run('event.published', event);
+      await attendance.confirmAttendance(event.eventId, userId, null);
+      return (await passes.listMyPasses(userId)).find((p) => p.eventId === event.eventId);
+    }
+
+    async function expectRejectedEvent(reason) {
+      const last = (await outbox('pass.check_in_rejected')).at(-1);
+      expectValid('booking', 'pass.check_in_rejected', last);
+      expect(last.reason).toBe(reason);
+    }
+
+    it('un QR con la firma alterada no entra y el pase sigue sirviendo', async () => {
+      const event = eventSnapshot();
+      const pass = await freshPass(event);
+      const last = pass.qr.at(-1) === 'A' ? 'B' : 'A';
+      const tampered = `${pass.qr.slice(0, -1)}${last}`;
+
+      expect(await scan(tampered, event.eventId)).toMatchObject({ outcome: 'rejected', reason: 'invalid_signature' });
+      await expectRejectedEvent('invalid_signature');
+      expect(await scan(pass.qr, event.eventId)).toMatchObject({ outcome: 'checked_in' });
+    });
+
+    it('un texto que no es un QR de Festa no entra', async () => {
+      const event = eventSnapshot();
+      await run('event.published', event);
+
+      for (const text of ['hola', 'FESTA1.no-es-un-uuid.tampoco.firma', `FESTA2.${crypto.randomUUID()}.${event.eventId}.abc`]) {
+        expect(await scan(text, event.eventId)).toMatchObject({ outcome: 'rejected', reason: 'invalid_signature' });
+      }
+    });
+
+    it('un QR bien firmado de un pase que no existe no entra', async () => {
+      const event = eventSnapshot();
+      await run('event.published', event);
+      const { qrFor } = await import('../src/passes/qr.js');
+
+      expect(await scan(qrFor(crypto.randomUUID(), event.eventId), event.eventId)).toMatchObject({
+        outcome: 'rejected',
+        reason: 'invalid_signature',
+      });
+    });
+
+    it('un QR de otro evento del mismo organizador no entra, y en su evento sí', async () => {
+      const mine = eventSnapshot({ title: 'Noche de jazz' });
+      const other = eventSnapshot({ title: 'Feria de ciencia' });
+      await run('event.published', other);
+      const pass = await freshPass(mine);
+
+      expect(await scan(pass.qr, other.eventId)).toMatchObject({ outcome: 'rejected', reason: 'wrong_event' });
+      await expectRejectedEvent('wrong_event');
+      expect(await scan(pass.qr, mine.eventId)).toMatchObject({ outcome: 'checked_in' });
+    });
+
+    it('el QR de una asistencia cancelada no entra', async () => {
+      const event = eventSnapshot();
+      const pass = await freshPass(event);
+
+      expect((await attendance.cancelAttendance(event.eventId, BUYER, null)).outcome).toBe('cancelled');
+      expect(await scan(pass.qr, event.eventId)).toMatchObject({ outcome: 'rejected', reason: 'revoked' });
+      await expectRejectedEvent('revoked');
+    });
+  });
+
   it('RF11: order.approved emite un pase por boleta (una sola vez) y order.refunded los revoca', async () => {
     const event = eventSnapshot({ ticketed: true, priceCents: 2_500_000 });
     await run('event.published', event);
