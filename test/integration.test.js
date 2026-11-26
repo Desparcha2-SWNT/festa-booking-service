@@ -1,0 +1,656 @@
+// Flujo completo contra PostgreSQL real: proyección, RSVP, boletas pagadas, check-in de un solo uso y
+// reembolso. Se salta sin TEST_DATABASE_URL (una base vacía; la prueba la limpia al empezar).
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import Ajv2020 from 'ajv/dist/2020.js';
+import addFormats from 'ajv-formats';
+
+const DB = process.env.TEST_DATABASE_URL;
+const contractsDir = process.env.FESTA_CONTRACTS_DIR ?? path.resolve('../festa-infra/contracts');
+const hasContracts = fs.existsSync(path.join(contractsDir, 'events'));
+
+const ORGANIZER = '1c2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f';
+const BUYER = '0b9c7d6e-5f4a-4b3c-8d2e-1a0b9c8d7e6f';
+const STRANGER = '2b9c7d6e-5f4a-4b3c-8d2e-1a0b9c8d7e6f';
+
+function validator(domain, name) {
+  const ajv = new Ajv2020({ allErrors: true, strict: false });
+  addFormats(ajv);
+  return ajv.compile(JSON.parse(fs.readFileSync(path.join(contractsDir, `events/${domain}/${name}.schema.json`), 'utf8')));
+}
+
+describe.skipIf(!DB || !hasContracts)('booking-service con PostgreSQL', () => {
+  let pool;
+  let withTransaction;
+  let handlers;
+  let attendance;
+  let passes;
+
+  const envelopeId = () => crypto.randomUUID();
+  const run = (type, data) => withTransaction((client) => handlers[type](data, client, { eventId: envelopeId(), eventType: type }));
+  const outbox = async (routingKey) =>
+    (await pool.query('SELECT payload FROM outbox WHERE routing_key = $1 ORDER BY created_at', [routingKey])).rows.map((r) => r.payload);
+  const expectValid = (domain, name, payload) => {
+    const validate = validator(domain, name);
+    validate(payload);
+    expect(validate.errors, JSON.stringify(validate.errors)).toBeNull();
+  };
+
+  function eventSnapshot(overrides = {}) {
+    const startsAt = new Date(Date.now() + 30 * 60_000);
+    return {
+      eventId: crypto.randomUUID(), organizerId: ORGANIZER, organizerType: 'merchant', title: 'Noche de jazz', description: 'x',
+      category: 'musical', startsAt: startsAt.toISOString(), endsAt: new Date(startsAt.getTime() + 3 * 3600_000).toISOString(),
+      venue: { name: 'Bloque G', address: 'ECI', location: { lat: 4.78, lng: -74.04 } }, capacity: 80, ticketed: false,
+      priceCents: 0, currency: 'COP', featured: false, isLive: false, status: 'published', version: 1, updatedAt: new Date().toISOString(),
+      ...overrides,
+    };
+  }
+
+  beforeAll(async () => {
+    process.env.DATABASE_URL = DB;
+    ({ pool, withTransaction } = await import('../src/db/pool.js'));
+    await pool.query('DROP SCHEMA public CASCADE; CREATE SCHEMA public;');
+    const { migrate } = await import('../src/db/migrate.js');
+    await migrate();
+    ({ handlers } = await import('../src/messaging/handlers.js'));
+    attendance = await import('../src/attendance/repository.js');
+    passes = await import('../src/passes/repository.js');
+  });
+  afterAll(async () => pool?.end());
+
+  it('RF7: RSVP a un evento gratis y QR de un solo uso (RF10/RNF7)', async () => {
+    const event = eventSnapshot();
+    await run('event.published', event);
+
+    const confirmed = await attendance.confirmAttendance(event.eventId, BUYER, null);
+    expect(confirmed.outcome).toBe('confirmed');
+    expectValid('booking', 'attendance.confirmed', (await outbox('attendance.confirmed')).at(-1));
+
+    const [mine] = await passes.listMyPasses(BUYER);
+    expect(mine.status).toBe('valid');
+
+    // Un desconocido no puede validar ingresos.
+    const stranger = await passes.checkIn({ qr: mine.qr, eventId: event.eventId, scannedBy: STRANGER, role: 'user' });
+    expect(stranger.reason).toBe('not_organizer');
+
+    const first = await passes.checkIn({ qr: mine.qr, eventId: event.eventId, scannedBy: ORGANIZER, role: 'merchant' });
+    expect(first.outcome).toBe('checked_in');
+    expectValid('booking', 'pass.checked_in', (await outbox('pass.checked_in')).at(-1));
+
+    const again = await passes.checkIn({ qr: mine.qr, eventId: event.eventId, scannedBy: ORGANIZER, role: 'merchant' });
+    expect(again).toMatchObject({ outcome: 'rejected', reason: 'already_used' });
+    for (const p of await outbox('pass.check_in_rejected')) expectValid('booking', 'pass.check_in_rejected', p);
+
+    expect((await passes.listMyPasses(BUYER))[0]).toMatchObject({ status: 'used', qr: null });
+  });
+
+  it('dos lecturas simultáneas del mismo QR: solo una entra', async () => {
+    const event = eventSnapshot();
+    await run('event.published', event);
+    await attendance.confirmAttendance(event.eventId, STRANGER, null);
+    const [pass] = (await passes.listMyPasses(STRANGER)).filter((p) => p.eventId === event.eventId);
+    const results = await Promise.all(
+      [1, 2, 3].map(() => passes.checkIn({ qr: pass.qr, eventId: event.eventId, scannedBy: ORGANIZER, role: 'merchant' })),
+    );
+    expect(results.filter((r) => r.outcome === 'checked_in')).toHaveLength(1);
+  });
+
+  it('el ingreso se rechaza fuera de la ventana', async () => {
+    const startsAt = new Date(Date.now() + 5 * 3600_000);
+    const event = eventSnapshot({ startsAt: startsAt.toISOString(), endsAt: new Date(startsAt.getTime() + 3600_000).toISOString() });
+    await run('event.published', event);
+    await attendance.confirmAttendance(event.eventId, BUYER, null);
+    const pass = (await passes.listMyPasses(BUYER)).find((p) => p.eventId === event.eventId);
+    const result = await passes.checkIn({ qr: pass.qr, eventId: event.eventId, scannedBy: ORGANIZER, role: 'merchant' });
+    expect(result.reason).toBe('outside_window');
+  });
+
+  // SCRUM-95: QR inválido, de otro evento y de un pase cancelado. Cada rechazo deja el pase como estaba y
+  // publica pass.check_in_rejected según el contrato.
+  describe('QR que no deben entrar (SCRUM-95)', () => {
+    const scan = (qr, eventId) => passes.checkIn({ qr, eventId, scannedBy: ORGANIZER, role: 'merchant' });
+
+    async function freshPass(event, userId = BUYER) {
+      await run('event.published', event);
+      await attendance.confirmAttendance(event.eventId, userId, null);
+      return (await passes.listMyPasses(userId)).find((p) => p.eventId === event.eventId);
+    }
+
+    async function expectRejectedEvent(reason) {
+      const last = (await outbox('pass.check_in_rejected')).at(-1);
+      expectValid('booking', 'pass.check_in_rejected', last);
+      expect(last.reason).toBe(reason);
+    }
+
+    it('un QR con la firma alterada no entra y el pase sigue sirviendo', async () => {
+      const event = eventSnapshot();
+      const pass = await freshPass(event);
+      const last = pass.qr.at(-1) === 'A' ? 'B' : 'A';
+      const tampered = `${pass.qr.slice(0, -1)}${last}`;
+
+      expect(await scan(tampered, event.eventId)).toMatchObject({ outcome: 'rejected', reason: 'invalid_signature' });
+      await expectRejectedEvent('invalid_signature');
+      expect(await scan(pass.qr, event.eventId)).toMatchObject({ outcome: 'checked_in' });
+    });
+
+    it('un texto que no es un QR de Festa no entra', async () => {
+      const event = eventSnapshot();
+      await run('event.published', event);
+
+      for (const text of ['hola', 'FESTA1.no-es-un-uuid.tampoco.firma', `FESTA2.${crypto.randomUUID()}.${event.eventId}.abc`]) {
+        expect(await scan(text, event.eventId)).toMatchObject({ outcome: 'rejected', reason: 'invalid_signature' });
+      }
+    });
+
+    it('un QR bien firmado de un pase que no existe no entra', async () => {
+      const event = eventSnapshot();
+      await run('event.published', event);
+      const { qrFor } = await import('../src/passes/qr.js');
+
+      expect(await scan(qrFor(crypto.randomUUID(), event.eventId), event.eventId)).toMatchObject({
+        outcome: 'rejected',
+        reason: 'invalid_signature',
+      });
+    });
+
+    it('un QR de otro evento del mismo organizador no entra, y en su evento sí', async () => {
+      const mine = eventSnapshot({ title: 'Noche de jazz' });
+      const other = eventSnapshot({ title: 'Feria de ciencia' });
+      await run('event.published', other);
+      const pass = await freshPass(mine);
+
+      expect(await scan(pass.qr, other.eventId)).toMatchObject({ outcome: 'rejected', reason: 'wrong_event' });
+      await expectRejectedEvent('wrong_event');
+      expect(await scan(pass.qr, mine.eventId)).toMatchObject({ outcome: 'checked_in' });
+    });
+
+    it('el QR de una asistencia cancelada no entra', async () => {
+      const event = eventSnapshot();
+      const pass = await freshPass(event);
+
+      expect((await attendance.cancelAttendance(event.eventId, BUYER, null)).outcome).toBe('cancelled');
+      expect(await scan(pass.qr, event.eventId)).toMatchObject({ outcome: 'rejected', reason: 'revoked' });
+      await expectRejectedEvent('revoked');
+    });
+  });
+
+  it('RF11: order.approved emite un pase por boleta (una sola vez) y order.refunded los revoca', async () => {
+    const event = eventSnapshot({ ticketed: true, priceCents: 2_500_000 });
+    await run('event.published', event);
+    const order = {
+      orderId: crypto.randomUUID(), eventId: event.eventId, organizerId: ORGANIZER, buyerId: BUYER, quantity: 3,
+      unitPriceCents: 2_500_000, subtotalCents: 7_500_000, commissionCents: 600_000, totalCents: 8_100_000, currency: 'COP',
+      paymentMethod: 'NEQUI', providerTransactionId: 'tx', approvedAt: new Date().toISOString(),
+    };
+    await run('order.approved', order);
+    await run('order.approved', order); // repetido: sin efecto
+
+    const tickets = (await passes.listMyPasses(BUYER)).filter((p) => p.eventId === event.eventId);
+    expect(tickets).toHaveLength(3);
+    const confirmed = (await outbox('attendance.confirmed')).at(-1);
+    expect(confirmed).toMatchObject({ source: 'ticket', orderId: order.orderId, attendeeCount: 3 });
+    expectValid('booking', 'attendance.confirmed', confirmed);
+
+    await run('order.refunded', { orderId: order.orderId, eventId: event.eventId, buyerId: BUYER, amountCents: 8_100_000, refundedBy: ORGANIZER, refundedAt: new Date().toISOString() });
+    const after = (await passes.listMyPasses(BUYER)).filter((p) => p.eventId === event.eventId);
+    expect(after.every((p) => p.status === 'revoked')).toBe(true);
+    const cancelled = (await outbox('attendance.cancelled')).at(-1);
+    expect(cancelled).toMatchObject({ reason: 'refunded', attendeeCount: 0 });
+    expectValid('booking', 'attendance.cancelled', cancelled);
+  });
+
+  it('un evento ticketed no admite RSVP gratis', async () => {
+    const event = eventSnapshot({ ticketed: true, priceCents: 1000 });
+    await run('event.published', event);
+    expect((await attendance.confirmAttendance(event.eventId, BUYER, null)).outcome).toBe('requires_ticket');
+  });
+
+  it('un snapshot retrasado no reabre un evento expirado', async () => {
+    const event = eventSnapshot({ version: 1 });
+    await run('event.published', event);
+    await run('event.expired', { eventId: event.eventId, expiredAt: new Date().toISOString(), isLive: false });
+    // event.expired no lleva versión: el event.updated retrasado (versión 2) no debe pasar la guarda.
+    await run('event.updated', { ...event, version: 2, status: 'published' });
+    const { rows } = await pool.query('SELECT status FROM event_projection WHERE event_id = $1', [event.eventId]);
+    expect(rows[0].status).toBe('expired');
+  });
+
+  it('un snapshot retrasado no reabre un evento cancelado', async () => {
+    const event = eventSnapshot({ version: 1 });
+    await run('event.published', event);
+    await run('event.cancelled', { eventId: event.eventId, version: 2, cancelledAt: new Date().toISOString() });
+    await run('event.updated', { ...event, version: 3, status: 'published' });
+    const { rows } = await pool.query('SELECT status FROM event_projection WHERE event_id = $1', [event.eventId]);
+    expect(rows[0].status).toBe('cancelled');
+  });
+
+  it('una orden aprobada después de cancelar el evento no emite pases ni suma cupo', async () => {
+    const event = eventSnapshot({ ticketed: true, priceCents: 1000, version: 1 });
+    await run('event.published', event);
+    await run('event.cancelled', { eventId: event.eventId, version: 2, cancelledAt: new Date().toISOString() });
+    const order = {
+      orderId: crypto.randomUUID(), eventId: event.eventId, organizerId: ORGANIZER, buyerId: BUYER, quantity: 2,
+      unitPriceCents: 1000, subtotalCents: 2000, commissionCents: 160, totalCents: 2160, currency: 'COP',
+      paymentMethod: 'NEQUI', providerTransactionId: 'tx', approvedAt: new Date().toISOString(),
+    };
+    await expect(run('order.approved', order)).rejects.toThrow(/requiere compensación/);
+    const { rows } = await pool.query('SELECT attendee_count FROM event_projection WHERE event_id = $1', [event.eventId]);
+    expect(rows[0].attendee_count).toBe(0);
+    const { rowCount } = await pool.query('SELECT 1 FROM attendances WHERE order_id = $1', [order.orderId]);
+    expect(rowCount).toBe(0);
+  });
+  describe('SCRUM-141: lista de asistentes para el organizador', () => {
+    const at = (minutesAgo) => new Date(Date.now() - minutesAgo * 60_000).toISOString();
+    const named = (userId, displayName, minutesAgo) => ({ userId, displayName, setAt: at(minutesAgo) });
+    const page = { limit: 50, offset: 0 };
+
+    it('el organizador ve a cada asistente con su nombre, sus boletas y si ya entró', async () => {
+      const event = eventSnapshot({ ticketed: true, priceCents: 1000 });
+      await run('event.published', event);
+      const ana = crypto.randomUUID();
+      const beto = crypto.randomUUID();
+      await run('account.display_name_set', named(ana, 'Ana', 60));
+      await run('account.display_name_set', named(ana, 'Ana María', 30));
+      // Un mensaje más viejo que llega tarde no pisa el nombre más nuevo.
+      await run('account.display_name_set', named(ana, 'Ana', 60));
+
+      const order = (buyerId, quantity) => ({
+        orderId: crypto.randomUUID(), eventId: event.eventId, organizerId: ORGANIZER, buyerId, quantity,
+        unitPriceCents: 1000, subtotalCents: 1000 * quantity, commissionCents: 80 * quantity, totalCents: 1080 * quantity,
+        currency: 'COP', paymentMethod: 'NEQUI', providerTransactionId: 'tx', approvedAt: new Date().toISOString(),
+      });
+      await run('order.approved', order(ana, 2));
+      await run('order.approved', order(beto, 1)); // beto aún no tiene nombre en booking
+      const [anaPass] = (await passes.listMyPasses(ana)).filter((p) => p.eventId === event.eventId);
+      await passes.checkIn({ qr: anaPass.qr, eventId: event.eventId, scannedBy: ORGANIZER, role: 'merchant' });
+
+      const result = await attendance.listAttendees(event.eventId, ORGANIZER, 'merchant', page);
+      expect(result.outcome).toBe('ok');
+      expect(result.list).toMatchObject({ attendeeCount: 3, total: 2 });
+      expect(result.list.items).toEqual([
+        expect.objectContaining({ displayName: 'Ana María', source: 'ticket', tickets: 2, checkedIn: 1 }),
+        expect.objectContaining({ displayName: null, source: 'ticket', tickets: 1, checkedIn: 0 }),
+      ]);
+      // Solo el nombre visible: el id de la persona no sale en la lista.
+      expect(JSON.stringify(result.list)).not.toContain(ana);
+    });
+
+    it('otro usuario recibe forbidden; un admin sí la ve; un evento inexistente da not_found', async () => {
+      const event = eventSnapshot();
+      await run('event.published', event);
+      await attendance.confirmAttendance(event.eventId, BUYER, null);
+
+      expect((await attendance.listAttendees(event.eventId, STRANGER, 'merchant', page)).outcome).toBe('forbidden');
+      expect((await attendance.listAttendees(event.eventId, BUYER, 'user', page)).outcome).toBe('forbidden');
+      expect((await attendance.listAttendees(event.eventId, STRANGER, 'admin', page)).outcome).toBe('ok');
+      expect((await attendance.listAttendees(crypto.randomUUID(), ORGANIZER, 'merchant', page)).outcome).toBe('not_found');
+    });
+
+    it('pagina en orden de confirmación y no muestra las asistencias canceladas', async () => {
+      const event = eventSnapshot();
+      await run('event.published', event);
+      const users = [crypto.randomUUID(), crypto.randomUUID(), crypto.randomUUID()];
+      for (const [i, userId] of users.entries()) {
+        await run('account.display_name_set', named(userId, `Persona ${i}`, 10));
+        await attendance.confirmAttendance(event.eventId, userId, null);
+      }
+      await attendance.cancelAttendance(event.eventId, users[1], null);
+
+      const page1 = await attendance.listAttendees(event.eventId, ORGANIZER, 'merchant', { limit: 1, offset: 0 });
+      const page2 = await attendance.listAttendees(event.eventId, ORGANIZER, 'merchant', { limit: 1, offset: 1 });
+      const past = await attendance.listAttendees(event.eventId, ORGANIZER, 'merchant', { limit: 1, offset: 5 });
+      expect(page1.list.items.map((a) => a.displayName)).toEqual(['Persona 0']);
+      expect(page2.list.items.map((a) => a.displayName)).toEqual(['Persona 2']);
+      expect([page1.list.total, page2.list.total, past.list.total]).toEqual([2, 2, 2]);
+      expect(past.list.items).toEqual([]);
+    });
+
+    it('al borrar la cuenta se borra su nombre y un mensaje atrasado no lo recrea (Ley 1581)', async () => {
+      const userId = crypto.randomUUID();
+      const nameOf = async () => (await pool.query('SELECT 1 FROM user_names WHERE user_id = $1', [userId])).rowCount;
+      await run('account.display_name_set', named(userId, 'Xime', 5));
+      await run('account.deleted', { userId, deletedAt: new Date().toISOString() });
+      expect(await nameOf()).toBe(0);
+
+      // Llega tarde, después del borrado, un mensaje con el nombre (anterior o incluso con hora posterior).
+      await run('account.display_name_set', named(userId, 'Xime', 10));
+      await run('account.display_name_set', named(userId, 'Xime', -5));
+      expect(await nameOf()).toBe(0);
+      // Un account.deleted repetido no falla.
+      await run('account.deleted', { userId, deletedAt: new Date().toISOString() });
+    });
+
+    it('el nombre y el borrado de la misma cuenta se procesan uno después del otro, aunque lleguen a la vez', async () => {
+      const userId = crypto.randomUUID();
+      const nameOf = async () => (await pool.query('SELECT 1 FROM user_names WHERE user_id = $1', [userId])).rowCount;
+
+      /** Espera a que `waiters` conexiones queden esperando el candado del usuario que retiene `holderPid`. */
+      async function untilWaiting(holderPid, waiters) {
+        const deadline = Date.now() + 4_000;
+        while (Date.now() < deadline) {
+          const { rowCount } = await pool.query(
+            `SELECT 1 FROM pg_stat_activity WHERE wait_event = 'advisory' AND $1 = ANY(pg_blocking_pids(pid))`,
+            [holderPid],
+          );
+          if (rowCount >= waiters) return;
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        throw new Error('los handlers no esperaron el candado del usuario');
+      }
+
+      // Se retiene el candado del usuario y se lanzan los dos mensajes: si no lo pidieran, correrían a la
+      // vez y el nombre podía quedar guardado después del borrado. Así, el que va segundo ve al primero.
+      const holder = await pool.connect();
+      try {
+        await holder.query('BEGIN');
+        await holder.query(`SELECT pg_advisory_xact_lock(hashtext('booking.user_names'), hashtext($1))`, [userId]);
+        const { rows: me } = await holder.query('SELECT pg_backend_pid() AS pid');
+        const deleted = run('account.deleted', { userId, deletedAt: new Date().toISOString() });
+        const named = run('account.display_name_set', { userId, displayName: 'Xime', setAt: new Date().toISOString() });
+        deleted.catch(() => {});
+        named.catch(() => {});
+        await untilWaiting(me[0].pid, 2);
+        await holder.query('COMMIT');
+        await Promise.all([deleted, named]);
+      } finally {
+        holder.release();
+      }
+
+      // Sea cual sea el orden en que tomaron el candado, el nombre no queda guardado.
+      expect(await nameOf()).toBe(0);
+    });
+  });
+
+  describe('SCRUM-142: mis planes', () => {
+    const hoursFromNow = (h) => new Date(Date.now() + h * 3600_000).toISOString();
+
+    /** Publica un evento y confirma la asistencia del usuario mientras todavía está abierto. */
+    async function attend(userId, overrides = {}) {
+      const event = eventSnapshot(overrides);
+      await run('event.published', event);
+      expect((await attendance.confirmAttendance(event.eventId, userId, null)).outcome).toBe('confirmed');
+      return event;
+    }
+
+    /** Mueve el evento al pasado con un snapshot nuevo (no se puede confirmar en uno que ya terminó). */
+    async function finish(event) {
+      await run('event.updated', { ...event, version: 2, startsAt: hoursFromNow(-5), endsAt: hoursFromNow(-2) });
+    }
+
+    it('separa próximos y pasados, con lugar y portada, y deja fuera lo ajeno', async () => {
+      const me = crypto.randomUUID();
+      const later = await attend(me, { title: 'Después', startsAt: hoursFromNow(48), endsAt: hoursFromNow(50), coverImageUrl: 'https://img.test/a.jpg' });
+      const soon = await attend(me, { title: 'Pronto' });
+      const old = await attend(me, { title: 'Ya fue' });
+      await finish(old);
+
+      // Lo que no debe salir: un plan que el usuario canceló, el de otra persona y una entrada paga.
+      const dropped = await attend(me, { title: 'Cancelado por mí' });
+      expect((await attendance.cancelAttendance(dropped.eventId, me, null)).outcome).toBe('cancelled');
+      await attend(STRANGER, { title: 'De otro' });
+      const paid = eventSnapshot({ ticketed: true, priceCents: 1000 });
+      await run('event.published', paid);
+      await run('order.approved', {
+        orderId: crypto.randomUUID(), eventId: paid.eventId, organizerId: ORGANIZER, buyerId: me, quantity: 1,
+        unitPriceCents: 1000, subtotalCents: 1000, commissionCents: 80, totalCents: 1080, currency: 'COP',
+        paymentMethod: 'NEQUI', providerTransactionId: 'tx', approvedAt: new Date().toISOString(),
+      });
+
+      const upcoming = await attendance.listMyPlans(me, { when: 'upcoming', limit: 20, offset: 0 });
+      expect(upcoming.total).toBe(2);
+      expect(upcoming.items.map((p) => p.title)).toEqual(['Pronto', 'Después']);
+      expect(upcoming.items[1]).toMatchObject({
+        eventId: later.eventId,
+        venueName: 'Bloque G',
+        coverImageUrl: 'https://img.test/a.jpg',
+        status: 'confirmed',
+        eventStatus: 'published',
+      });
+      expect(upcoming.items[0].eventId).toBe(soon.eventId);
+      expect(upcoming.items[0].coverImageUrl).toBeNull();
+
+      const past = await attendance.listMyPlans(me, { when: 'past', limit: 20, offset: 0 });
+      expect(past.items.map((p) => p.title)).toEqual(['Ya fue']);
+    });
+
+    it('un plan anulado porque el organizador canceló el evento sigue en pasados, marcado', async () => {
+      const me = crypto.randomUUID();
+      const event = await attend(me, { title: 'Se canceló' });
+      // Otro plan del mismo evento que el usuario canceló antes no debe aparecer.
+      expect((await attendance.cancelAttendance(event.eventId, me, null)).outcome).toBe('cancelled');
+      expect((await attendance.confirmAttendance(event.eventId, me, null)).outcome).toBe('confirmed');
+      await run('event.cancelled', { eventId: event.eventId, version: 2, cancelledAt: new Date().toISOString() });
+
+      expect((await attendance.listMyPlans(me, { when: 'upcoming', limit: 20, offset: 0 })).total).toBe(0);
+      const past = await attendance.listMyPlans(me, { when: 'past', limit: 20, offset: 0 });
+      expect(past.total).toBe(1);
+      expect(past.items[0]).toMatchObject({ eventId: event.eventId, status: 'event_cancelled', eventStatus: 'cancelled' });
+    });
+
+    it('pagina y da el total aunque la página pedida ya esté vacía', async () => {
+      const me = crypto.randomUUID();
+      for (const h of [3, 2, 1]) await attend(me, { startsAt: hoursFromNow(h), endsAt: hoursFromNow(h + 1) });
+
+      const first = await attendance.listMyPlans(me, { when: 'upcoming', limit: 2, offset: 0 });
+      expect(first.items).toHaveLength(2);
+      expect(first.total).toBe(3);
+      const second = await attendance.listMyPlans(me, { when: 'upcoming', limit: 2, offset: 2 });
+      expect(second.items).toHaveLength(1);
+      expect(new Set([...first.items, ...second.items].map((p) => p.eventId)).size).toBe(3);
+      const beyond = await attendance.listMyPlans(me, { when: 'upcoming', limit: 2, offset: 10 });
+      expect(beyond).toMatchObject({ items: [], total: 3 });
+    });
+
+    // «Mis planes» separa lo que canceló el usuario de lo que anuló el organizador al cancelar el evento con
+    // `cancelled_at >= closed_at`. Eso solo es cierto si las dos operaciones toman el candado del evento ANTES de
+    // fijar su hora. Se retiene el candado de la fila del evento, se lanzan las dos operaciones en un orden
+    // conocido y se suelta: el orden en que quedan esperando es el orden en que lo toman.
+    describe('concurrencia: cancelación del usuario frente a event.cancelled', () => {
+      /** Espera a que haya `waiters` conexiones esperando un candado en esta base. */
+      async function untilWaiting(waiters) {
+        const deadline = Date.now() + 5_000;
+        while (Date.now() < deadline) {
+          const { rows } = await pool.query(
+            `SELECT count(*)::int AS n FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND pid <> pg_backend_pid()`,
+          );
+          if (rows[0].n >= waiters) return;
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        throw new Error('las operaciones no esperaron el candado del evento');
+      }
+
+      /** Retiene el candado del evento, lanza `first` y luego `second` (cada una queda esperando) y lo suelta. */
+      async function race(eventId, first, second) {
+        const holder = await pool.connect();
+        try {
+          await holder.query('BEGIN');
+          await holder.query('SELECT 1 FROM event_projection WHERE event_id = $1 FOR UPDATE', [eventId]);
+          const a = first();
+          a.catch(() => {});
+          await untilWaiting(1);
+          const b = second();
+          b.catch(() => {});
+          await untilWaiting(2);
+          await holder.query('COMMIT');
+          return await Promise.all([a, b]);
+        } finally {
+          holder.release();
+        }
+      }
+
+      const cancelEvent = (event) => () => run('event.cancelled', { eventId: event.eventId, version: 2, cancelledAt: new Date().toISOString() });
+      const userCancels = (event, userId) => () => attendance.cancelAttendance(event.eventId, userId, null);
+      const plans = (userId, when) => attendance.listMyPlans(userId, { when, limit: 20, offset: 0 });
+
+      it('si el usuario cancela primero, el plan no aparece: lo canceló él, no el organizador', async () => {
+        const me = crypto.randomUUID();
+        const event = eventSnapshot();
+        await run('event.published', event);
+        expect((await attendance.confirmAttendance(event.eventId, me, null)).outcome).toBe('confirmed');
+
+        const [userResult] = await race(event.eventId, userCancels(event, me), cancelEvent(event));
+        expect(userResult.outcome).toBe('cancelled');
+
+        expect((await plans(me, 'upcoming')).total).toBe(0);
+        expect((await plans(me, 'past')).total).toBe(0);
+      });
+
+      it('si el evento se cancela primero, el plan queda en pasados como event_cancelled', async () => {
+        const me = crypto.randomUUID();
+        const event = eventSnapshot();
+        await run('event.published', event);
+        expect((await attendance.confirmAttendance(event.eventId, me, null)).outcome).toBe('confirmed');
+
+        const [, userResult] = await race(event.eventId, cancelEvent(event), userCancels(event, me));
+        expect(userResult.outcome).toBe('not_attending');
+
+        expect((await plans(me, 'upcoming')).total).toBe(0);
+        const past = await plans(me, 'past');
+        expect(past.total).toBe(1);
+        expect(past.items[0]).toMatchObject({ eventId: event.eventId, status: 'event_cancelled', eventStatus: 'cancelled' });
+      });
+    });
+  });
+
+  // event-service ordena los conteos por confirmedAt / cancelledAt: si la hora se fijara antes de tener el
+  // candado del evento, una transacción que lo esperó publicaría el conteo más nuevo con una hora más vieja.
+  describe('la hora de confirmar y cancelar es posterior al candado del evento', () => {
+    /**
+     * Espera a que `waiters` conexiones queden esperando el candado de fila (no basta con dejar pasar tiempo).
+     * La primera espera a quien retiene el evento; las siguientes, a la que está antes en la fila, así que se
+     * cuenta cualquier espera cuya cadena de bloqueo llegue a `holderPid`.
+     */
+    async function untilSomeoneWaits(holderPid, waiters = 1) {
+      const deadline = Date.now() + 5_000;
+      while (Date.now() < deadline) {
+        const { rowCount } = await pool.query(
+          `WITH RECURSIVE chain AS (
+             SELECT pid FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND $1 = ANY(pg_blocking_pids(pid))
+             UNION
+             SELECT a.pid FROM pg_stat_activity a JOIN chain c ON c.pid = ANY(pg_blocking_pids(a.pid))
+             WHERE a.wait_event_type = 'Lock'
+           )
+           SELECT pid FROM chain`,
+          [holderPid],
+        );
+        if (rowCount >= waiters) return;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      throw new Error('ninguna consulta llegó a esperar el candado del evento');
+    }
+
+    /** Retiene el evento con FOR UPDATE, lanza la acción, espera a que quede bloqueada y libera. */
+    async function whileLocked(eventId, action) {
+      const holder = await pool.connect();
+      try {
+        await holder.query('BEGIN');
+        await holder.query('SELECT 1 FROM event_projection WHERE event_id = $1 FOR UPDATE', [eventId]);
+        const { rows: me } = await holder.query('SELECT pg_backend_pid() AS pid');
+        const pending = action();
+        pending.catch(() => {}); // el error, si lo hay, se ve en el await de abajo
+        await untilSomeoneWaits(me[0].pid);
+        const { rows } = await holder.query('SELECT clock_timestamp() AS t');
+        await holder.query('COMMIT');
+        return { result: await pending, releasedAt: rows[0].t.getTime() };
+      } finally {
+        holder.release();
+      }
+    }
+
+    /**
+     * Como whileLocked, pero con varias acciones que quedan en fila esperando el candado, en el orden dado:
+     * cada una se lanza cuando la anterior ya está esperando. PostgreSQL entrega el candado en ese orden.
+     */
+    async function whileLockedInOrder(eventId, actions) {
+      const holder = await pool.connect();
+      try {
+        await holder.query('BEGIN');
+        await holder.query('SELECT 1 FROM event_projection WHERE event_id = $1 FOR UPDATE', [eventId]);
+        const { rows: me } = await holder.query('SELECT pg_backend_pid() AS pid');
+        const pending = [];
+        for (const [i, action] of actions.entries()) {
+          const p = action();
+          p.catch(() => {});
+          pending.push(p);
+          await untilSomeoneWaits(me[0].pid, i + 1);
+        }
+        await holder.query('COMMIT');
+        return await Promise.all(pending);
+      } finally {
+        holder.release();
+      }
+    }
+
+    const cancelledOf = async (attendanceId) =>
+      (await outbox('attendance.cancelled')).find((m) => m.attendanceId === attendanceId);
+
+    it('RSVP: confirmar y cancelar', async () => {
+      const event = eventSnapshot();
+      await run('event.published', event);
+
+      const confirmed = await whileLocked(event.eventId, () => attendance.confirmAttendance(event.eventId, STRANGER, null));
+      expect(confirmed.result.outcome).toBe('confirmed');
+      const confirmMsg = (await outbox('attendance.confirmed')).find((m) => m.eventId === event.eventId && m.userId === STRANGER);
+      expect(new Date(confirmMsg.confirmedAt).getTime()).toBeGreaterThanOrEqual(confirmed.releasedAt);
+
+      const cancelled = await whileLocked(event.eventId, () => attendance.cancelAttendance(event.eventId, STRANGER, null));
+      expect(cancelled.result.outcome).toBe('cancelled');
+      const cancelMsg = await cancelledOf(confirmed.result.attendance.attendanceId);
+      expect(new Date(cancelMsg.cancelledAt).getTime()).toBeGreaterThanOrEqual(cancelled.releasedAt);
+    });
+
+    it('order.refunded', async () => {
+      const event = eventSnapshot({ ticketed: true, priceCents: 1000 });
+      await run('event.published', event);
+      const order = {
+        orderId: crypto.randomUUID(), eventId: event.eventId, organizerId: ORGANIZER, buyerId: BUYER, quantity: 1,
+        unitPriceCents: 1000, subtotalCents: 1000, commissionCents: 80, totalCents: 1080, currency: 'COP',
+        paymentMethod: 'NEQUI', providerTransactionId: 'tx', approvedAt: new Date().toISOString(),
+      };
+      await run('order.approved', order);
+      const { rows } = await pool.query('SELECT id FROM attendances WHERE order_id = $1', [order.orderId]);
+
+      const refund = { orderId: order.orderId, eventId: event.eventId, buyerId: BUYER, amountCents: 1080, refundedBy: ORGANIZER, refundedAt: new Date().toISOString() };
+      const { releasedAt } = await whileLocked(event.eventId, () => run('order.refunded', refund));
+      const cancelMsg = await cancelledOf(rows[0].id);
+      expect(cancelMsg).toMatchObject({ reason: 'refunded', attendeeCount: 0 });
+      expect(new Date(cancelMsg.cancelledAt).getTime()).toBeGreaterThanOrEqual(releasedAt);
+    });
+
+    it('account.deleted', async () => {
+      const event = eventSnapshot();
+      await run('event.published', event);
+      const userId = crypto.randomUUID();
+      const confirmed = await attendance.confirmAttendance(event.eventId, userId, null);
+
+      const { releasedAt } = await whileLocked(event.eventId, () => run('account.deleted', { userId, deletedAt: new Date().toISOString() }));
+      const cancelMsg = await cancelledOf(confirmed.attendance.attendanceId);
+      expect(cancelMsg).toMatchObject({ reason: 'account_deleted', attendeeCount: 0 });
+      expect(new Date(cancelMsg.cancelledAt).getTime()).toBeGreaterThanOrEqual(releasedAt);
+    });
+
+    it('event.cancelled y account.deleted a la vez sobre la misma asistencia: se anula una sola vez', async () => {
+      const event = eventSnapshot();
+      await run('event.published', event);
+      const userId = crypto.randomUUID();
+      const confirmed = await attendance.confirmAttendance(event.eventId, userId, null);
+      const attendanceId = confirmed.attendance.attendanceId;
+
+      // Los dos leen la asistencia como confirmada mientras el evento está retenido; event.cancelled
+      // queda primero en la fila del candado, así que account.deleted llega cuando ya está anulada.
+      await whileLockedInOrder(event.eventId, [
+        () => run('event.cancelled', { eventId: event.eventId, version: 2, cancelledAt: new Date().toISOString() }),
+        () => run('account.deleted', { userId, deletedAt: new Date().toISOString() }),
+      ]);
+
+      const messages = (await outbox('attendance.cancelled')).filter((m) => m.attendanceId === attendanceId);
+      expect(messages).toHaveLength(1);
+      expect(messages[0]).toMatchObject({ reason: 'event_cancelled', attendeeCount: 0 });
+      const { rows } = await pool.query('SELECT attendee_count FROM event_projection WHERE event_id = $1', [event.eventId]);
+      expect(rows[0].attendee_count).toBe(0);
+    });
+  });
+});
