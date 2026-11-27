@@ -1,3 +1,4 @@
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { withTransaction } from '../db/pool.js';
 import { config } from '../config.js';
 import { logger } from '../logger.js';
@@ -63,9 +64,10 @@ async function handle(channel, msg, registry) {
   }
 
   const expectedExchange = registry.getExpectedExchange(envelope.eventType);
-  if (expectedExchange && msg.fields.exchange !== expectedExchange) {
+  const origin = originExchange(msg);
+  if (expectedExchange && origin !== expectedExchange) {
     logger.error(
-      { expectedExchange, actual: msg.fields.exchange, eventType: envelope.eventType },
+      { expectedExchange, actual: origin, eventType: envelope.eventType },
       'llegó por un exchange distinto al que declara su esquema, va directo a la DLQ',
     );
     return channel.nack(msg, false, false);
@@ -129,7 +131,17 @@ async function handleFailure(channel, msg, envelope, err) {
       channel.sendToQueue(
         RETRY_QUEUE,
         msg.content,
-        { ...msg.properties, headers: { ...msg.properties.headers, 'x-retry-count': retryCount + 1 } },
+        {
+          ...msg.properties,
+          headers: {
+            ...msg.properties.headers,
+            'x-retry-count': retryCount + 1,
+            // La cola de reintento devuelve el mensaje por el exchange por defecto (fields.exchange vacío):
+            // el origen viaja firmado para que la comprobación del exchange lo siga aceptando.
+            'x-origin-exchange': originExchange(msg),
+            'x-origin-signature': signOrigin(originExchange(msg), msg.content),
+          },
+        },
         (publishErr) => (publishErr ? reject(publishErr) : resolve()),
       );
     });
@@ -144,4 +156,30 @@ async function handleFailure(channel, msg, envelope, err) {
 }
 
 // Export solo para pruebas.
-export const _internal = { handlers, handle, handleFailure };
+/** Firma del origen de un reintento, atada al contenido exacto del mensaje (no se puede pasar a otro). */
+function signOrigin(origin, content) {
+  const digest = createHash('sha256').update(content).digest('hex');
+  return createHmac('sha256', config.inboxRetryKey).update(`${origin}
+${digest}`).digest('hex');
+}
+
+/**
+ * Exchange por el que llegó el mensaje originalmente. Un reintento vuelve a la inbox desde la cola de reintento
+ * (dead-letter por el exchange por defecto, así que `fields.exchange` llega vacío): su origen va en
+ * `x-origin-exchange`, firmado por este servicio en `x-origin-signature`. Con las credenciales de RabbitMQ
+ * compartidas cualquiera puede publicar en la inbox y poner el header, pero sin la clave no puede firmarlo: un
+ * origen sin firma válida cuenta como vacío y va a la DLQ. No sustituye a los usuarios y permisos por servicio.
+ */
+function originExchange(msg) {
+  const exchange = msg.fields?.exchange ?? '';
+  if (exchange !== '') return exchange;
+  const headers = msg.properties?.headers ?? {};
+  const origin = headers['x-origin-exchange'];
+  const signature = headers['x-origin-signature'];
+  if (typeof origin !== 'string' || typeof signature !== 'string') return '';
+  const expected = Buffer.from(signOrigin(origin, msg.content), 'hex');
+  const given = Buffer.from(signature, 'hex');
+  return given.length === expected.length && timingSafeEqual(given, expected) ? origin : '';
+}
+
+export const _internal = { handlers, handle, handleFailure, originExchange };
