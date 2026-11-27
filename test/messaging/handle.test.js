@@ -128,3 +128,70 @@ describe('handleFailure (reintentos)', () => {
     expect(channel.sendToQueue).not.toHaveBeenCalled();
   });
 });
+
+describe('origen de un reintento (x-origin-exchange firmado)', () => {
+  // La cola booking-service.inbox.retry hace dead-letter por el exchange por defecto: el mensaje vuelve a la
+  // inbox con fields.exchange vacío. Sin el origen firmado, todo reintento iba directo a la DLQ.
+  async function retried(original) {
+    const channel = fakeChannel();
+    channel.sendToQueue.mockImplementation((queue, content, options, cb) => cb(null));
+    await _internal.handleFailure(channel, original, { eventType: 'order.approved' }, new Error('falla transitoria'));
+    const [, content, options] = channel.sendToQueue.mock.calls[0];
+    return { content, properties: options, fields: { exchange: '' } };
+  }
+
+  it('un reintento que vuelve por el exchange por defecto conserva su exchange de origen', async () => {
+    const back = await retried({ content: Buffer.from('{"a":1}'), properties: { headers: {} }, fields: { exchange: 'festa.payment' } });
+
+    expect(_internal.originExchange(back)).toBe('festa.payment');
+  });
+
+  it('un segundo reintento conserva el origen del primero', async () => {
+    const first = await retried({ content: Buffer.from('{"a":1}'), properties: { headers: {} }, fields: { exchange: 'festa.payment' } });
+    const second = await retried(first);
+
+    expect(_internal.originExchange(second)).toBe('festa.payment');
+  });
+
+  it('un origen sin firma válida cuenta como vacío', () => {
+    const forged = {
+      content: Buffer.from('{"a":1}'),
+      properties: { headers: { 'x-origin-exchange': 'festa.payment', 'x-origin-signature': 'ab'.repeat(32) } },
+      fields: { exchange: '' },
+    };
+
+    expect(_internal.originExchange(forged)).toBe('');
+  });
+
+  it('la firma no sirve para otro contenido', async () => {
+    const back = await retried({ content: Buffer.from('{"a":1}'), properties: { headers: {} }, fields: { exchange: 'festa.payment' } });
+
+    expect(_internal.originExchange({ ...back, content: Buffer.from('{"a":2}') })).toBe('');
+  });
+
+  it('handle acepta el reintento firmado y rechaza uno sin firma', async () => {
+    const envelope = { eventType: 'merchant.verified', producer: 'user-service', data: {} };
+    const original = { content: Buffer.from(JSON.stringify(envelope)), properties: { headers: {} }, fields: { exchange: 'festa.user' } };
+    const back = await retried(original);
+    const registry = fakeRegistry({ expectedProducer: 'user-service', expectedExchange: 'festa.user', dataValidator: () => false });
+
+    const ch1 = fakeChannel();
+    await _internal.handle(ch1, back, registry);
+    // Pasa la comprobación del exchange y llega a la del data (que aquí falla a propósito).
+    expect(registry.getDataValidator).toHaveBeenCalled();
+
+    const ch2 = fakeChannel();
+    const unsigned = { ...back, properties: { headers: { 'x-retry-count': 1 } } };
+    registry.getDataValidator.mockClear();
+    await _internal.handle(ch2, unsigned, registry);
+    expect(ch2.nack).toHaveBeenCalledWith(unsigned, false, false);
+    expect(registry.getDataValidator).not.toHaveBeenCalled();
+  });
+});
+
+describe('resolveInboxRetryKey', () => {
+  it.each([undefined, '', 'corta', 'change-me-por-favor-123456'])('rechaza %s', async (value) => {
+    const { resolveInboxRetryKey } = await import('../../src/config.js');
+    expect(() => resolveInboxRetryKey(value)).toThrow(/INBOX_RETRY_KEY/);
+  });
+});

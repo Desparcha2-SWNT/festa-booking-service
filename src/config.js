@@ -16,6 +16,24 @@ export function parseTrustProxy(value) {
   return value;
 }
 
+const MIN_RETRY_KEY_LENGTH = 16;
+
+/**
+ * Clave que firma el origen de los reintentos de la inbox. Es OBLIGATORIA y estable: con otra en cada arranque, un
+ * reintento que sobreviva a un reinicio (o que reciba otra réplica) llegaría con una firma que ya no vale y se iría a
+ * la DLQ. No puede ser vacía, corta ni un valor de ejemplo (`change-me…`). Se genera con `openssl rand -hex 32`.
+ */
+export function resolveInboxRetryKey(value) {
+  if (value === undefined) throw new Error('Falta la variable de entorno INBOX_RETRY_KEY (openssl rand -hex 32)');
+  const key = value.trim();
+  if (key.length < MIN_RETRY_KEY_LENGTH || /^change-?me/i.test(key)) {
+    throw new Error(
+      `INBOX_RETRY_KEY está vacía, tiene menos de ${MIN_RETRY_KEY_LENGTH} caracteres o es un valor de ejemplo: define una clave real (openssl rand -hex 32)`,
+    );
+  }
+  return value;
+}
+
 export const config = {
   port: Number(process.env.PORT ?? 8084),
   // Las peticiones llegan a través de Kong, que agrega la IP del cliente en X-Forwarded-For.
@@ -33,5 +51,6 @@ export const config = {
   qrSigningSecretPath: required('QR_SIGNING_SECRET_PATH'),
   // El ingreso se habilita estos minutos antes del inicio y cierra cuando termina el evento.
   checkInOpensMinutesBefore: Number(process.env.CHECKIN_OPENS_MINUTES_BEFORE ?? 120),
+  inboxRetryKey: resolveInboxRetryKey(process.env.INBOX_RETRY_KEY),
   contractsDir: process.env.FESTA_CONTRACTS_DIR ?? path.resolve('../festa-infra/contracts'),
 };

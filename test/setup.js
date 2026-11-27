@@ -20,3 +20,4 @@ process.env.LOG_LEVEL ??= 'silent';
 const qrPath = path.join(dir, 'qr_signing.key');
 writeFileSync(qrPath, 'secreto-de-prueba-para-qr');
 process.env.QR_SIGNING_SECRET_PATH = qrPath;
+process.env.INBOX_RETRY_KEY ??= 'clave-de-prueba-para-reintentos-0123456789';
