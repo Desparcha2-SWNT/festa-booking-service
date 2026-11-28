@@ -12,6 +12,22 @@ export async function lockEvent(client, eventId) {
   return rows[0];
 }
 
+/**
+ * Serializa por usuario los handlers que tocan su nombre. El consumidor procesa varios mensajes a la vez:
+ * sin esto, un account.display_name_set podía leer `deleted_users` antes de que se confirmara el borrado
+ * y recrear el nombre después. Con el candado, el que llega segundo espera y ve lo que hizo el primero.
+ * Es de transacción: se suelta solo con el COMMIT o el ROLLBACK.
+ */
+export async function lockUser(client, userId) {
+  await client.query(`SELECT pg_advisory_xact_lock(hashtext('booking.user_names'), hashtext($1))`, [userId]);
+}
+
+/** ¿La cuenta ya se borró (account.deleted)? Su lápida queda en deleted_users. */
+async function isDeleted(client, userId) {
+  const { rowCount } = await client.query('SELECT 1 FROM deleted_users WHERE user_id = $1', [userId]);
+  return rowCount > 0;
+}
+
 async function findActiveRsvp(db, eventId, userId) {
   const { rows } = await db.query(
     `SELECT a.id, a.confirmed_at,
@@ -58,6 +74,11 @@ export function toConfirmedMessage(event, attendance, userId, attendeeCount, { s
 /** Confirma el RSVP de un evento gratis. Repetirlo devuelve la misma asistencia, sin publicar. */
 export async function confirmAttendance(eventId, userId, correlationId) {
   return withTransaction(async (client) => {
+    // Mismo orden de candados que account.deleted (usuario y luego evento). Sin el del usuario, una
+    // confirmación con el token aún vigente podía comprometerse en medio del borrado: el DELETE la
+    // borraba sin restarla del conteo y el cupo quedaba ocupado para siempre.
+    await lockUser(client, userId);
+    if (await isDeleted(client, userId)) return { outcome: 'account_deleted' };
     const event = await lockEvent(client, eventId);
     if (!event) return { outcome: 'not_found' };
 
