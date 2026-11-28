@@ -15,6 +15,7 @@ const ERRORS = {
   closed: [409, 'el evento ya no admite este cambio de asistencia'],
   requires_ticket: [409, 'este evento requiere comprar una entrada'],
   full: [409, 'el evento no tiene cupos disponibles'],
+  account_deleted: [403, 'la cuenta fue eliminada'],
 };
 
 function sendError(res, outcome) {

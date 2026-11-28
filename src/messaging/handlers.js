@@ -1,5 +1,7 @@
-import { lockEvent, revokeAttendance } from '../attendance/repository.js';
+import { lockEvent, lockUser, revokeAttendance } from '../attendance/repository.js';
 import { issueTickets, revokeOrder } from '../passes/repository.js';
+
+export { lockUser };
 
 // Un handler por tipo de mensaje consumido. Recibe `data` del sobre, el `client` de una transacción
 // ya abierta y el `envelope` completo. Lo que no tenga handler se confirma sin efecto.
@@ -17,16 +19,6 @@ async function closeEvent(client, eventId, status) {
       status,
     ],
   );
-}
-
-/**
- * Serializa por usuario los handlers que tocan su nombre. El consumidor procesa varios mensajes a la vez:
- * sin esto, un account.display_name_set podía leer `deleted_users` antes de que se confirmara el borrado
- * y recrear el nombre después. Con el candado, el que llega segundo espera y ve lo que hizo el primero.
- * Es de transacción: se suelta solo con el COMMIT o el ROLLBACK.
- */
-export async function lockUser(client, userId) {
-  await client.query(`SELECT pg_advisory_xact_lock(hashtext('booking.user_names'), hashtext($1))`, [userId]);
 }
 
 /**
