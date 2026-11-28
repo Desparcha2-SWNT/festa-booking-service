@@ -653,4 +653,51 @@ describe.skipIf(!DB || !hasContracts)('booking-service con PostgreSQL', () => {
       expect(rows[0].attendee_count).toBe(0);
     });
   });
+  describe('borrado de cuenta frente a una confirmación (auditoría de seguridad, 2026-11-28)', () => {
+    it('una cuenta borrada no confirma asistencia con su token aún vigente', async () => {
+      const event = eventSnapshot();
+      await run('event.published', event);
+      const userId = crypto.randomUUID();
+      await run('account.deleted', { userId, deletedAt: new Date().toISOString() });
+
+      const result = await attendance.confirmAttendance(event.eventId, userId, null);
+      expect(result.outcome).toBe('account_deleted');
+      const { rows } = await pool.query('SELECT attendee_count FROM event_projection WHERE event_id = $1', [event.eventId]);
+      expect(rows[0].attendee_count).toBe(0);
+      expect((await pool.query('SELECT 1 FROM attendances WHERE user_id = $1', [userId])).rowCount).toBe(0);
+    });
+
+    it('confirmar espera el candado del usuario que toma account.deleted, así no se cruza con el borrado', async () => {
+      const event = eventSnapshot();
+      await run('event.published', event);
+      const userId = crypto.randomUUID();
+      const holder = await pool.connect();
+      try {
+        await holder.query('BEGIN');
+        await holder.query(`SELECT pg_advisory_xact_lock(hashtext('booking.user_names'), hashtext($1))`, [userId]);
+        const { rows: me } = await holder.query('SELECT pg_backend_pid() AS pid');
+        const confirming = attendance.confirmAttendance(event.eventId, userId, null);
+        confirming.catch(() => {});
+
+        const deadline = Date.now() + 4_000;
+        let waiting = 0;
+        while (Date.now() < deadline && waiting === 0) {
+          ({ rowCount: waiting } = await pool.query(
+            `SELECT 1 FROM pg_stat_activity WHERE wait_event = 'advisory' AND $1 = ANY(pg_blocking_pids(pid))`,
+            [me[0].pid],
+          ));
+          if (waiting === 0) await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        expect(waiting).toBe(1);
+        // Mientras espera, el borrado se compromete: al tomar el candado, la confirmación ve la lápida.
+        await holder.query('INSERT INTO deleted_users (user_id, deleted_at) VALUES ($1, now())', [userId]);
+        await holder.query('COMMIT');
+        expect((await confirming).outcome).toBe('account_deleted');
+      } finally {
+        holder.release();
+      }
+      const { rows } = await pool.query('SELECT attendee_count FROM event_projection WHERE event_id = $1', [event.eventId]);
+      expect(rows[0].attendee_count).toBe(0);
+    });
+  });
 });
